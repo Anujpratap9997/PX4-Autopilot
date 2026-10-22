@@ -1,0 +1,6 @@
+menuconfig MODULES_CAPABLE_CONTROL
+	bool "capable_control"
+	default n
+	---help---
+		Standalone flight mode running the geometric high-authority controller of
+		MATH_Rishabh.pdf straight to actuator_motors (no PX4 control loops).

@@ -221,6 +221,13 @@ bool GZBridge::subscribePoseInfo(bool required)
 		return required ? false : true;
 	}
 
+	// Exact model pose at the model's PosePublisher rate (x500_capable: 250 Hz), if the model has one.
+	std::string model_pose_topic = "/model/" + _model_name + "/pose";
+
+	if (!_node.Subscribe(model_pose_topic, &GZBridge::modelPoseCallback, this)) {
+		PX4_ERR("failed to subscribe to %s", model_pose_topic.c_str());
+	}
+
 	return true;
 }
 
@@ -483,93 +490,158 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
 
 void GZBridge::poseInfoCallback(const gz::msgs::Pose_V &msg)
 {
-	const uint64_t timestamp = hrt_absolute_time();
+	// The model's own PosePublisher stream (250 Hz) takes precedence over the world pose/info (50 Hz).
+	if (_model_pose_seen) {
+		return;
+	}
 
 	for (int p = 0; p < msg.pose_size(); p++) {
 		if (msg.pose(p).name() == _model_name) {
-
-			const double dt = math::constrain((timestamp - _timestamp_prev) * 1e-6, 0.001, 0.1);
-			_timestamp_prev = timestamp;
-
-			gz::msgs::Vector3d pose_position = msg.pose(p).position();
-			gz::msgs::Quaternion pose_orientation = msg.pose(p).orientation();
-
-			// ground truth
-			gz::math::Quaterniond q_gr = gz::math::Quaterniond(
-							     pose_orientation.w(),
-							     pose_orientation.x(),
-							     pose_orientation.y(),
-							     pose_orientation.z());
-
-			gz::math::Quaterniond q_nb;
-			GZBridge::rotateQuaternion(q_nb, q_gr);
-
-			// publish attitude groundtruth
-			vehicle_attitude_s vehicle_attitude_groundtruth{};
-			vehicle_attitude_groundtruth.timestamp_sample = timestamp;
-			vehicle_attitude_groundtruth.q[0] = q_nb.W();
-			vehicle_attitude_groundtruth.q[1] = q_nb.X();
-			vehicle_attitude_groundtruth.q[2] = q_nb.Y();
-			vehicle_attitude_groundtruth.q[3] = q_nb.Z();
-			vehicle_attitude_groundtruth.timestamp = timestamp;
-			_attitude_ground_truth_pub.publish(vehicle_attitude_groundtruth);
-
-			// publish angular velocity groundtruth
-			const matrix::Eulerf euler{matrix::Quatf(vehicle_attitude_groundtruth.q)};
-			vehicle_angular_velocity_s vehicle_angular_velocity_groundtruth{};
-			vehicle_angular_velocity_groundtruth.timestamp_sample = timestamp;
-			const matrix::Vector3f angular_velocity = (euler - _euler_prev) / dt;
-			_euler_prev = euler;
-			angular_velocity.copyTo(vehicle_angular_velocity_groundtruth.xyz);
-
-			vehicle_angular_velocity_groundtruth.timestamp = timestamp;
-			_angular_velocity_ground_truth_pub.publish(vehicle_angular_velocity_groundtruth);
-
-			vehicle_local_position_s local_position_groundtruth{};
-			local_position_groundtruth.timestamp_sample = timestamp;
-			// position ENU -> NED
-			const matrix::Vector3d position{pose_position.y(), pose_position.x(), -pose_position.z()};
-			const matrix::Vector3d velocity{(position - _position_prev) / dt};
-			const matrix::Vector3d acceleration{(velocity - _velocity_prev) / dt};
-
-			_position_prev = position;
-			_velocity_prev = velocity;
-
-			local_position_groundtruth.ax = acceleration(0);
-			local_position_groundtruth.ay = acceleration(1);
-			local_position_groundtruth.az = acceleration(2);
-			local_position_groundtruth.vx = velocity(0);
-			local_position_groundtruth.vy = velocity(1);
-			local_position_groundtruth.vz = velocity(2);
-			local_position_groundtruth.x = position(0);
-			local_position_groundtruth.y = position(1);
-			local_position_groundtruth.z = position(2);
-
-			local_position_groundtruth.heading = euler.psi();
-
-			if (_pos_ref.isInitialized()) {
-
-				local_position_groundtruth.ref_lat = _pos_ref.getProjectionReferenceLat(); // Reference point latitude in degrees
-				local_position_groundtruth.ref_lon = _pos_ref.getProjectionReferenceLon(); // Reference point longitude in degrees
-				local_position_groundtruth.ref_alt = _alt_ref;
-				local_position_groundtruth.ref_timestamp = _pos_ref.getProjectionReferenceTimestamp();
-				local_position_groundtruth.xy_global = true;
-				local_position_groundtruth.z_global = true;
-
-			} else {
-				local_position_groundtruth.ref_lat = static_cast<double>(NAN);
-				local_position_groundtruth.ref_lon = static_cast<double>(NAN);
-				local_position_groundtruth.ref_alt = NAN;
-				local_position_groundtruth.ref_timestamp = 0;
-				local_position_groundtruth.xy_global = false;
-				local_position_groundtruth.z_global = false;
-			}
-
-			local_position_groundtruth.timestamp = timestamp;
-			_lpos_ground_truth_pub.publish(local_position_groundtruth);
+			publishPoseGroundTruth(msg.pose(p), msg.header());
 			return;
 		}
 	}
+}
+
+void GZBridge::modelPoseCallback(const gz::msgs::Pose_V &msg)
+{
+	// Only the world-frame pose of the model. (OdometryPublisher also publishes on this topic,
+	// relative to its own odom frame.) The sim-time stamp is in each pose's own header.
+	for (int p = 0; p < msg.pose_size(); p++) {
+		const gz::msgs::Pose &pose = msg.pose(p);
+
+		if (pose.name() != _model_name) {
+			continue;
+		}
+
+		for (int i = 0; i < pose.header().data_size(); i++) {
+			const auto &d = pose.header().data(i);
+
+			if (d.key() == "frame_id" && d.value_size() > 0 && d.value(0) == _world_name) {
+				if (!_model_pose_seen) {
+					PX4_INFO("ground truth from /model/%s/pose", _model_name.c_str());
+					_model_pose_seen = true;
+				}
+
+				publishPoseGroundTruth(pose, pose.header());
+				return;
+			}
+		}
+	}
+}
+
+void GZBridge::publishPoseGroundTruth(const gz::msgs::Pose &pose, const gz::msgs::Header &header)
+{
+	const uint64_t timestamp = hrt_absolute_time();
+
+	// Differences are taken over the simulation time between the two poses, not the receive time.
+	double sim_time = header.stamp().sec() + header.stamp().nsec() * 1e-9;
+
+	if (sim_time <= 0.0) {
+		sim_time = timestamp * 1e-6; // unstamped message: fall back to the (lockstep) PX4 clock
+	}
+
+	const double dt = sim_time - _pose_sim_time_prev;
+	const bool first = _pose_sim_time_prev < 0.0;
+
+	if (!first && dt <= 0.0) {
+		return; // repeated sample
+	}
+
+	gz::msgs::Vector3d pose_position = pose.position();
+	gz::msgs::Quaternion pose_orientation = pose.orientation();
+
+	// ground truth
+	gz::math::Quaterniond q_gr = gz::math::Quaterniond(
+					     pose_orientation.w(),
+					     pose_orientation.x(),
+					     pose_orientation.y(),
+					     pose_orientation.z());
+
+	gz::math::Quaterniond q_nb;
+	GZBridge::rotateQuaternion(q_nb, q_gr);
+
+	// position ENU -> NED
+	const matrix::Vector3d position{pose_position.y(), pose_position.x(), -pose_position.z()};
+
+	// Body (FRD) angular velocity from the attitude change over the step: q_prev^-1 * q = exp(w dt / 2)
+	matrix::Vector3d angular_velocity{};
+	matrix::Vector3d velocity{};
+	matrix::Vector3d acceleration{};
+
+	if (!first) {
+		gz::math::Quaterniond dq = _q_nb_prev.Inverse() * q_nb;
+
+		if (dq.W() < 0.0) {
+			dq = gz::math::Quaterniond(-dq.W(), -dq.X(), -dq.Y(), -dq.Z());
+		}
+
+		const matrix::Vector3d v{dq.X(), dq.Y(), dq.Z()};
+		const double s = v.norm();
+		angular_velocity = (s > 1e-12) ? matrix::Vector3d(v * (2.0 * atan2(s, dq.W()) / (s * dt))) : matrix::Vector3d(v * (2.0 / dt));
+
+		velocity = (position - _position_prev) / dt;
+		acceleration = (velocity - _velocity_prev) / dt;
+	}
+
+	_pose_sim_time_prev = sim_time;
+	_q_nb_prev = q_nb;
+	_position_prev = position;
+	_velocity_prev = velocity;
+
+	// publish attitude groundtruth
+	vehicle_attitude_s vehicle_attitude_groundtruth{};
+	vehicle_attitude_groundtruth.timestamp_sample = timestamp;
+	vehicle_attitude_groundtruth.q[0] = q_nb.W();
+	vehicle_attitude_groundtruth.q[1] = q_nb.X();
+	vehicle_attitude_groundtruth.q[2] = q_nb.Y();
+	vehicle_attitude_groundtruth.q[3] = q_nb.Z();
+	vehicle_attitude_groundtruth.timestamp = timestamp;
+	_attitude_ground_truth_pub.publish(vehicle_attitude_groundtruth);
+
+	// publish angular velocity groundtruth
+	vehicle_angular_velocity_s vehicle_angular_velocity_groundtruth{};
+	vehicle_angular_velocity_groundtruth.timestamp_sample = timestamp;
+	vehicle_angular_velocity_groundtruth.xyz[0] = angular_velocity(0);
+	vehicle_angular_velocity_groundtruth.xyz[1] = angular_velocity(1);
+	vehicle_angular_velocity_groundtruth.xyz[2] = angular_velocity(2);
+	vehicle_angular_velocity_groundtruth.timestamp = timestamp;
+	_angular_velocity_ground_truth_pub.publish(vehicle_angular_velocity_groundtruth);
+
+	vehicle_local_position_s local_position_groundtruth{};
+	local_position_groundtruth.timestamp_sample = timestamp;
+	local_position_groundtruth.ax = acceleration(0);
+	local_position_groundtruth.ay = acceleration(1);
+	local_position_groundtruth.az = acceleration(2);
+	local_position_groundtruth.vx = velocity(0);
+	local_position_groundtruth.vy = velocity(1);
+	local_position_groundtruth.vz = velocity(2);
+	local_position_groundtruth.x = position(0);
+	local_position_groundtruth.y = position(1);
+	local_position_groundtruth.z = position(2);
+
+	local_position_groundtruth.heading = matrix::Eulerf(matrix::Quatf(vehicle_attitude_groundtruth.q)).psi();
+
+	if (_pos_ref.isInitialized()) {
+
+		local_position_groundtruth.ref_lat = _pos_ref.getProjectionReferenceLat(); // Reference point latitude in degrees
+		local_position_groundtruth.ref_lon = _pos_ref.getProjectionReferenceLon(); // Reference point longitude in degrees
+		local_position_groundtruth.ref_alt = _alt_ref;
+		local_position_groundtruth.ref_timestamp = _pos_ref.getProjectionReferenceTimestamp();
+		local_position_groundtruth.xy_global = true;
+		local_position_groundtruth.z_global = true;
+
+	} else {
+		local_position_groundtruth.ref_lat = static_cast<double>(NAN);
+		local_position_groundtruth.ref_lon = static_cast<double>(NAN);
+		local_position_groundtruth.ref_alt = NAN;
+		local_position_groundtruth.ref_timestamp = 0;
+		local_position_groundtruth.xy_global = false;
+		local_position_groundtruth.z_global = false;
+	}
+
+	local_position_groundtruth.timestamp = timestamp;
+	_lpos_ground_truth_pub.publish(local_position_groundtruth);
 }
 
 void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)

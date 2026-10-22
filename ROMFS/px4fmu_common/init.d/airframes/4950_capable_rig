@@ -1,0 +1,133 @@
+#!/bin/sh
+#
+# @name capable_control rig vehicle (Holybro X500 V2 on the 3-DOF rig)
+#
+# @type Quadrotor x
+# @class Copter
+#
+# @maintainer Rishabh Parwal
+#
+# Holybro X500 V2 (AXI 2212/12 1950 KV, Gemfan 6045 props, 3S) on the 3-DOF gimbal rig: yaw ring (outer), roll ring,
+# pitch bar carrying the drone. Flown by the capable_control module (MATH_Rishabh.pdf) and, for
+# checks, by stock PX4 in Stabilized. Values marked MEASURE come from the vehicle, IDENTIFY from the
+# rig sysid flight (capable_control fly sysid -F, then identify_motor.py --rig).
+# See px4_offboard/RIG_RUNBOOK.md and px4_offboard/RIG_STABILIZED_FIX.md.
+#
+
+. ${R}etc/init.d/rc.mc_defaults
+
+# --- Stock Stabilized on the rig (RIG_STABILIZED_FIX.md), tested 2026-10-20 (log_16) -------
+# Roll: the rig's roll axis also swings the roll ring (about 12 x the pitch inertia). Pitch K lowered from 3
+# to 1.5: K 3 gave a 13 Hz rate-loop oscillation growing with throttle (log_16).
+param set-default IMU_GYRO_CUTOFF 30
+param set-default MC_ROLLRATE_K 5.0
+param set-default MC_ROLLRATE_P 0.5
+param set-default MC_ROLLRATE_I 0.2
+param set-default MC_ROLLRATE_D 0.01
+param set-default MC_ROLL_P 2.0
+param set-default MC_PITCHRATE_K 1.5
+param set-default MC_PITCHRATE_P 0.2
+param set-default MC_PITCHRATE_I 0.1
+param set-default MC_PITCHRATE_D 0.008
+param set-default MC_PITCH_P 2.0
+# Yaw locked by stoppers: no yaw torque (stock 0.2 and 0.1 when the yaw axis is free)
+param set-default MC_YAWRATE_P 0.0
+param set-default MC_YAWRATE_I 0.0
+
+# --- Outputs: ESCs on FMU PWM OUT (AUX) 1-4, PWM 400 Hz (no DShot), ESC calibration 1100 to 1900 us --
+param set-default PWM_AUX_FUNC1 101
+param set-default PWM_AUX_FUNC2 102
+param set-default PWM_AUX_FUNC3 103
+param set-default PWM_AUX_FUNC4 104
+param set-default PWM_AUX_TIM0 400
+param set-default PWM_AUX_MIN1 1100
+param set-default PWM_AUX_MIN2 1100
+param set-default PWM_AUX_MIN3 1100
+param set-default PWM_AUX_MIN4 1100
+param set-default PWM_AUX_MAX1 1900
+param set-default PWM_AUX_MAX2 1900
+param set-default PWM_AUX_MAX3 1900
+param set-default PWM_AUX_MAX4 1900
+param set-default PWM_AUX_DIS1 1000
+param set-default PWM_AUX_DIS2 1000
+param set-default PWM_AUX_DIS3 1000
+param set-default PWM_AUX_DIS4 1000
+
+# --- Rotor geometry, PX4 quad X order and spin ------------------------------------ MEASURE
+# PX/PY: rotor position from the rig pivot [m] (forward / right), 500 mm wheelbase at 45 deg;
+# KM: yaw moment / thrust [m] of the 6045 prop (estimate), + for CCW rotors.
+param set-default CA_AIRFRAME 0
+param set-default CA_ROTOR_COUNT 4
+param set-default CA_ROTOR0_PX 0.177
+param set-default CA_ROTOR0_PY 0.177
+param set-default CA_ROTOR0_KM 0.011
+param set-default CA_ROTOR1_PX -0.177
+param set-default CA_ROTOR1_PY -0.177
+param set-default CA_ROTOR1_KM 0.011
+param set-default CA_ROTOR2_PX 0.177
+param set-default CA_ROTOR2_PY -0.177
+param set-default CA_ROTOR2_KM -0.011
+param set-default CA_ROTOR3_PX -0.177
+param set-default CA_ROTOR3_PY 0.177
+param set-default CA_ROTOR3_KM -0.011
+
+# --- Vehicle for capable_control --------------------------------------------
+# MEASURE [kg], drone on the rig (2.75 kg until weighed)
+param set-default CC_MASS 2.75
+# [kg m^2] inertia about the pivot at level: drone (gz x500 scaled to 2.75 kg: 0.025 / 0.025 / 0.045) plus
+# the pitch bar on pitch, bar and roll ring on roll, all rings on yaw. The module's torque scales with
+# these, so each axis gets the designed omega_n despite the rings. IDENTIFY (sysid -F).
+param set-default CC_IXX 0.30
+param set-default CC_IYY 0.0255
+param set-default CC_IZZ 1.60
+# [N] max thrust of one rotor: AXI 2212/12 + 6045 on 3S, about 6 N (estimate) MEASURE
+param set-default CC_ROT_FMAX 6.0
+# thrust fraction out. THR_MDL_FAC 0 as in the stock tuning: the output is linear in the command, thrust
+# about quadratic; at the rig collective (CC_RIG_THR 0.5) the torque per command matches the linear model.
+param set-default CC_THR_MODEL 0
+param set-default THR_MDL_FAC 0.0
+# IDENTIFY [s] motor lag + delay (identify_motor.py --rig --axes roll pitch)
+param set-default CC_MOT_TAU 0.04
+# Attitude-only tests (fly -F) command up to 1 g tilts: the lateral limit and thrust budget must not
+# clip them (the rig caps the real thrust with CC_RIG_THR). No drag feed-forward: on the rig the
+# reference velocity is not flown (the tilt test's reaches 49 m/s).
+param set-default CC_ACC_MAX_G 1.5
+param set-default CC_TW_MAX 2.0
+param set-default CC_DRAG 0.0
+
+# --- Attitude law: paper (5.7b) with Fix 1 (lead), docs/motor_lag_fixes.pdf ------
+# Mode 1, not 3: the rig log (motors on) showed gyro noise of about 0.008 rad/s above 5 Hz, where mode 3's
+# INDI amplifies it into motor jitter (ESTIMATE_ROBUSTNESS.md). omega_n 6, zeta 1: 60 deg phase margin
+# with 50 ms motor lag and 8 ms delay (margin_check.py); raise toward 8 after the sysid.
+param set-default CC_ATT_MODE 1
+param set-default CC_ATT_WN 6.0
+param set-default CC_ATT_ZETA 1.0
+
+# --- Start at boot: registers the Capable Control mode (External Mode 1) for the RC switch --
+param set-default CC_AUTOSTART 1
+
+# --- Rig safety (capable_control) ------------------------------------------
+param set-default CC_RIG_EN 1
+# collective cap, fraction of 4 x CC_ROT_FMAX: 0.5 leaves the most room for torque (3 N per rotor)
+param set-default CC_RIG_THR 0.5
+# [deg] the 1 g tilt test reaches 45 deg: must be inside the gimbal range (lower it for 0.5 g: 27 deg)
+param set-default CC_RIG_TILT 55
+# [deg/s]
+param set-default CC_RIG_RATE 180
+# [s] soft start
+param set-default CC_RIG_RAMP 3.0
+# yaw locked by stoppers: no yaw torque from the module (set 1 when the yaw axis is free)
+param set-default CC_RIG_YAW 0
+
+# --- PX4: indoors on the rig, no GPS, no position, RC only -----------------------
+param set-default COM_ARM_WO_GPS 1
+param set-default EKF2_GPS_CTRL 0
+param set-default NAV_DLL_ACT 0
+# only the RC transmitter (with the kill switch) controls the vehicle
+param set-default COM_RC_IN_MODE 0
+# the rig never takes off: no automatic disarm
+param set-default COM_DISARM_PRFLT -1
+param set-default COM_DISARM_LAND -1
+
+# --- Logging: every controller tick (capable_control_status) + full-rate rates -
+param set-default SDLOG_PROFILE 17

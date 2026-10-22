@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# @name capable_control free flight (Holybro X500 V2)
+#
+# @type Quadrotor x
+# @class Copter
+#
+# @maintainer Rishabh Parwal
+#
+# Holybro X500 V2 (2216 KV920, T1045II props, 4S, Pixhawk 6C, GPS) flown outdoors by the capable_control
+# module (MATH_Rishabh.pdf). Stock PX4 (airframe 4019 values) flies it in every other mode. Values marked
+# MEASURE come from the vehicle, IDENTIFY from the in-flight sysid (capable_control fly sysid, then
+# identify_motor.py). See px4_offboard/FREE_FLIGHT.md.
+#
+
+. ${R}etc/init.d/rc.mc_defaults
+
+# --- Stock X500 V2 (airframe 4019) ---------------------------------------------
+param set-default IMU_GYRO_CUTOFF 30
+param set-default MC_ROLLRATE_P 0.14
+param set-default MC_PITCHRATE_P 0.14
+param set-default MC_ROLLRATE_I 0.3
+param set-default MC_PITCHRATE_I 0.3
+param set-default MC_ROLLRATE_D 0.004
+param set-default MC_PITCHRATE_D 0.004
+
+# --- Rotor geometry in physical units (capable_control mixes with it), PX4 quad X order and spin
+# PX/PY: 500 mm wheelbase at 45 deg [m]; KM: yaw moment / thrust of the 1045 prop [m], + for CCW
+param set-default CA_AIRFRAME 0
+param set-default CA_ROTOR_COUNT 4
+param set-default CA_ROTOR0_PX 0.177
+param set-default CA_ROTOR0_PY 0.177
+param set-default CA_ROTOR0_KM 0.0139
+param set-default CA_ROTOR1_PX -0.177
+param set-default CA_ROTOR1_PY -0.177
+param set-default CA_ROTOR1_KM 0.0139
+param set-default CA_ROTOR2_PX 0.177
+param set-default CA_ROTOR2_PY -0.177
+param set-default CA_ROTOR2_KM -0.0139
+param set-default CA_ROTOR3_PX -0.177
+param set-default CA_ROTOR3_PY 0.177
+param set-default CA_ROTOR3_KM -0.0139
+
+# --- Vehicle for capable_control --------------------------------------------
+# MEASURE [kg], all up with battery
+param set-default CC_MASS 2.75
+# IDENTIFY [kg m^2] (estimate from PX4's gz x500, scaled for the extra mass)
+param set-default CC_IXX 0.025
+param set-default CC_IYY 0.025
+param set-default CC_IZZ 0.045
+# [N] max thrust of one rotor: 13.1 N at 16 V, about 11.5 N under load
+param set-default CC_ROT_FMAX 11.5
+# thrust fraction out; THR_MDL_FAC linearises the ESCs (fit of the Holybro thrust test)
+param set-default CC_THR_MODEL 0
+param set-default THR_MDL_FAC 0.56
+# [1/s] linear drag, estimate (rotor drag); identify from the translate flight
+param set-default CC_DRAG 0.10
+
+# --- Limits for this vehicle: T/W about 1.7 at 2.75 kg (the paper's vehicle: 5.5) ---
+# CC_TW_MAX keeps about 6 % of the thrust free for attitude; CC_ACC_MAX_G is the lateral limit (5.1)
+param set-default CC_TW_MAX 1.6
+param set-default CC_ACC_MAX_G 1.0
+param set-default CC_V_MAX 10.0
+
+# --- Attitude law: paper (5.7b) with Fix 1 + 2 (docs/motor_lag_fixes.pdf) ------
+# IDENTIFY [s] motor lag + delay (identify_motor.py); first-flight gains with a 55 deg margin,
+# raise CC_ATT_WN toward 12 after the sysid (margin_check.py)
+param set-default CC_MOT_TAU 0.053
+param set-default CC_ATT_MODE 3
+param set-default CC_ATT_WN 8.0
+param set-default CC_ATT_ZETA 1.0
+param set-default CC_RIG_EN 0
+param set-default CC_RIG_YAW 1
+
+# --- PX4: outdoors with GPS, RC in charge, geofence ------------------------------
+# only the RC transmitter (with the kill switch and mode switch) controls the vehicle
+param set-default COM_RC_IN_MODE 0
+# geofence: Return mode beyond 80 m horizontally or 40 m up
+param set-default GF_MAX_HOR_DIST 80
+param set-default GF_MAX_VER_DIST 40
+param set-default GF_ACTION 3
+
+# --- Logging: every controller tick (capable_control_status) + full-rate rates -
+param set-default SDLOG_PROFILE 17

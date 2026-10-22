@@ -47,6 +47,7 @@ void LoggedTopics::add_default_topics()
 {
 	add_topic("action_request");
 	add_topic("actuator_armed");
+	add_topic("capable_control_status");
 	add_optional_topic("actuator_controls_status_0", 300);
 	add_optional_topic("airspeed_validated", 200);
 	add_optional_topic("autotune_attitude_control_status", 100);

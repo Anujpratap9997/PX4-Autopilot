@@ -130,6 +130,8 @@ private:
 	void airPressureCallback(const gz::msgs::FluidPressure &msg);
 	void imuCallback(const gz::msgs::IMU &msg);
 	void poseInfoCallback(const gz::msgs::Pose_V &msg);
+	void modelPoseCallback(const gz::msgs::Pose_V &msg);
+	void publishPoseGroundTruth(const gz::msgs::Pose &pose, const gz::msgs::Header &header);
 	void odometryCallback(const gz::msgs::OdometryWithCovariance &msg);
 	void navSatCallback(const gz::msgs::NavSat &msg);
 	void laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg);
@@ -177,8 +179,9 @@ private:
 
 	matrix::Vector3d _position_prev{};
 	matrix::Vector3d _velocity_prev{};
-	matrix::Vector3f _euler_prev{};
-	hrt_abstime _timestamp_prev{};
+	gz::math::Quaterniond _q_nb_prev{};
+	double _pose_sim_time_prev{-1.0};  // sim time [s] of the previous pose sample
+	bool _model_pose_seen{false};      // model PosePublisher stream present: ignore the world pose/info
 
 	const std::string _world_name;
 	const std::string _model_name;

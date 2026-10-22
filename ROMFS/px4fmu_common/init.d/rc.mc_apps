@@ -56,3 +56,11 @@ if param compare -s MC_RAPTOR_ENABLE 1
 then
 	mc_raptor start
 fi
+
+#
+# capable_control (capable boards only): registers the Capable Control flight mode.
+#
+if param compare -s CC_AUTOSTART 1
+then
+	capable_control start
+fi

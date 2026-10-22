@@ -1,0 +1,61 @@
+#!/bin/sh
+#
+# @name QuadrotorX SITL for SIH -- "capable" chaser (MATH_Rishabh.pdf, Table II)
+#
+# @type Quadrotor
+#
+# Stock SIH quadx, with only the physical parameters changed to the paper's chaser.
+# Flown by an external controller in Offboard direct_actuator mode, so no PX4
+# control loop runs; PX4 provides estimation, arming and failsafes only.
+#
+
+. ${R}etc/init.d-posix/airframes/10040_sihsim_quadx
+
+# --- Vehicle: Table II chaser ------------------------------------------------
+param set-default SIH_MASS 3.0
+param set-default SIH_IXX 0.025
+param set-default SIH_IYY 0.025
+param set-default SIH_IZZ 0.046
+# Rotor limit: T/W = 6.00 at the rotor rail  ->  6.0 * 3.0 kg * 9.80665 / 4 rotors
+param set-default SIH_T_MAX 44.13
+# Roll/pitch authority 11.0 N m (paper: l*b*w_max^2). SIH is an X frame whose max
+# differential roll torque is 2 * L * T_MAX, so L = 11.0 / (2 * 44.13).
+param set-default SIH_L_ROLL 0.1246
+param set-default SIH_L_PITCH 0.1246
+# Yaw authority 1.76 N m (paper: 2*d*w_max^2); SIH max yaw torque is 2 * Q_MAX.
+param set-default SIH_Q_MAX 0.88
+# Linear drag k_D = 0.18 1/s (Assumption A4); SIH_KDV is a force coefficient, m*k_D.
+param set-default SIH_KDV 0.54
+# Motor lag: first-order on thrust, SIH stock 50 ms (the configuration of the main results).
+# Motor-lag study: 0.055 (T-Motor 3115 900KV estimate, px4_offboard/MOTOR_MODEL.md), with
+# CC_ATT_MODE 3, CC_ATT_WN 12, CC_ATT_ZETA 1.0 (docs/motor_lag_fixes.pdf).
+param set-default SIH_T_TAU 0.05
+
+# --- capable_control mixer: rotor geometry in PHYSICAL units -----------------
+# Same SIH motor order and signs as 10040 (PX4 numbering), scaled so that
+# Mx = -PY*F, My = PX*F, Mz = KM*F reproduce SIH's force model exactly:
+# |PX| = |PY| = SIH_L_ROLL = 0.1246 m, |KM| = SIH_Q_MAX / SIH_T_MAX = 0.88 / 44.13.
+param set-default CA_ROTOR0_PX 0.1246
+param set-default CA_ROTOR0_PY 0.1246
+param set-default CA_ROTOR0_KM 0.019941
+param set-default CA_ROTOR1_PX -0.1246
+param set-default CA_ROTOR1_PY -0.1246
+param set-default CA_ROTOR1_KM 0.019941
+param set-default CA_ROTOR2_PX 0.1246
+param set-default CA_ROTOR2_PY -0.1246
+param set-default CA_ROTOR2_KM -0.019941
+param set-default CA_ROTOR3_PX -0.1246
+param set-default CA_ROTOR3_PY 0.1246
+param set-default CA_ROTOR3_KM -0.019941
+param set-default CC_ROT_FMAX 44.13
+param set-default CC_THR_MODEL 0
+
+# --- Standalone external control --------------------------------------------
+# No GCS is required to arm; the offboard node arms and disarms itself.
+param set-default NAV_DLL_ACT 0
+# Never let the land detector or preflight timer disarm under the external controller.
+param set-default COM_DISARM_LAND -1
+param set-default COM_DISARM_PRFLT -1
+
+# --- Logging: default set + full-rate attitude, rates and actuators ----------
+param set-default SDLOG_PROFILE 17

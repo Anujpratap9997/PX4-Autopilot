@@ -71,6 +71,8 @@ px4_add_romfs_files(
 	3011_jsbsim_hexarotor_x
 
 	4001_gz_x500
+	4050_gz_x500_capable
+	4051_gz_x500_real
 	4002_gz_x500_depth
 	4003_gz_rc_cessna
 	4004_gz_standard_vtol
@@ -112,6 +114,7 @@ px4_add_romfs_files(
 	10043_sihsim_standard_vtol
 	10044_sihsim_hex
 	10045_sihsim_rover_ackermann
+	10050_sihsim_quadx_capable
 
 	17001_flightgear_tf-g1
 	17002_flightgear_tf-g2
