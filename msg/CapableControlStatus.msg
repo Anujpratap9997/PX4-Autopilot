@@ -44,6 +44,7 @@ uint8 PHASE_RETURN = 21        # fly back over the take-off point before landing
 uint8 PHASE_DIVE = 22          # Sec. V-J test: fixed acceleration command (acc_ref), no position loop
 uint8 PHASE_TILT = 24          # rig test (fly tilt -F): held pure-pitch or pure-roll tilt, or the ramps to and from it
 uint8 PHASE_SYSID = 23         # motor identification: pseudo-random torque injected on one axis at a time (torque_inj)
+uint8 PHASE_HOLD_IDLE = 25     # STATE_HOLD between fly commands (after an RC switch-in, the end of a test or a hand-back)
 
 bool upright              # Sec. V-J regime: true = upright (5.9), false = inverting
 

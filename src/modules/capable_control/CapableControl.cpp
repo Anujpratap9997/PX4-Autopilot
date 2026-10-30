@@ -20,6 +20,8 @@
 
 using namespace capable;
 
+ModuleBase::Descriptor CapableControl::desc{task_spawn, custom_command, print_usage};
+
 namespace
 {
 // PX4 NED/FRD <-> controller NWU/FLU: a 180 deg rotation about x on both sides.
@@ -99,7 +101,7 @@ static constexpr const char *CC_PARAMS[] = {
 	"CC_MASS", "CC_IXX", "CC_IYY", "CC_IZZ", "CC_ACC_MAX_G", "CC_TW_MAX", "CC_V_MAX", "CC_ATT_WN", "CC_ATT_ZETA",
 	"CC_YAW_WN", "CC_YAW_ZETA", "CC_DRAG", "CC_POS_KP", "CC_VEL_KD", "CC_ROT_FMAX", "CC_THR_MODEL", "CC_TRUTH_SRC",
 	"CC_UPRIGHT", "CC_ATT_MODE", "CC_MOT_TAU", "CC_COMP_TAU", "CC_RIG_EN", "CC_RIG_THR", "CC_RIG_TILT",
-	"CC_RIG_RATE", "CC_RIG_RAMP", "CC_RIG_YAW"
+	"CC_RIG_RATE", "CC_RIG_RAMP", "CC_RIG_YAW", "CC_ENG_RAMP"
 };
 
 /* CAPABLE_PARAMS lines: name=value (without CC_), float32 values exact (%.9g); rig_log.py reads them. */
@@ -179,12 +181,14 @@ void CapableControl::check_registration()
 
 void CapableControl::configure_mode()
 {
-	// Every control flag off: no PX4 position/velocity/attitude/rate controller and no control
+	// Direct actuators: every control flag off, no PX4 position/velocity/attitude/rate controller and no control
 	// allocator runs in this mode. This module writes actuator_motors itself.
-	vehicle_control_mode_s cfg{};
+	setpoint_config_s cfg{};
 	cfg.timestamp = hrt_absolute_time();
 	cfg.source_id = _mode_id;
-	_config_control_setpoints_pub.publish(cfg);
+	cfg.type = setpoint_config_s::TYPE_DIRECT_ACTUATORS;
+	cfg.should_apply = true;
+	_setpoint_config_pub.publish(cfg);
 	_last_config_publish = cfg.timestamp;
 }
 
@@ -274,6 +278,7 @@ bool CapableControl::load_vehicle()
 	_rig_tilt = get_param_f("CC_RIG_TILT", ok);
 	_rig_rate = get_param_f("CC_RIG_RATE", ok);
 	_rig_ramp = get_param_f("CC_RIG_RAMP", ok);
+	_eng_ramp = get_param_f("CC_ENG_RAMP", ok);
 
 	// --- mixer: wrench [T; Mx; My; Mz] (FRD) = A f, column i = F_max [1, -PY_i, PX_i, KM_i]
 	// (same convention as ActuatorEffectivenessRotors with the thrust axis -z)
@@ -355,14 +360,22 @@ const char *CapableControl::rig_violation(const Quat &q, const V3 &w) const
 	return nullptr;
 }
 
-/* Rig output limits: no yaw torque when the yaw axis is locked (CC_RIG_YAW 0), soft-start scale on thrust and
+/* Output limits. Free flight: after an RC switch-in, the collective blended from the stock one over CC_ENG_RAMP
+ * (torque at once). Rig: no yaw torque when the yaw axis is locked (CC_RIG_YAW 0), soft-start scale on thrust and
  * torque, then the collective cap. */
-void CapableControl::rig_limit(double &thrust, V3 &torque, double now_s, float &scale, bool &capped) const
+void CapableControl::limit_output(double &thrust, V3 &torque, double now_s, float &scale, bool &capped) const
 {
 	scale = 1.f;
 	capped = false;
 
-	if (!_rig) { return; }
+	if (!_rig) {
+		if (_engage_thrust >= 0.0 && _eng_ramp > 0.0) {
+			scale = (float)fmin(1.0, fmax(0.0, now_s / _eng_ramp));
+			thrust = _engage_thrust + (thrust - _engage_thrust) * (double)scale;
+		}
+
+		return;
+	}
 
 	if (!_rig_yaw) { torque(2) = 0.0; }   // yaw locked on the rig: the motor range goes to roll and pitch
 
@@ -499,6 +512,83 @@ void CapableControl::publish_motors(const float u[4])
 	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; i++) { m.control[i] = i < 4 ? u[i] : NAN; }
 
 	_actuator_motors_pub.publish(m);
+
+	for (int i = 0; i < 4; i++) { _last_u[i] = u[i]; }
+}
+
+/* Free flight: hold here and ask the commander for Position mode (repeated from HOLD every 0.5 s until it
+ * switches). When it refuses (no position or attitude), its own failsafe for this mode's requirements takes over. */
+void CapableControl::hand_back(const V3 &p, const Quat &q)
+{
+	const M3 R = to_rotation_matrix(q);
+	_hold_p = p;
+	_hold_yaw = atan2(R(1, 0), R(0, 0));
+	_requested.ref_only = false;   // hold position, on the real state
+	_requested.virt = false;
+	_last_sample = 0;
+	_last_command = 0;
+	_handing_back = true;
+	_state = capable_control_status_s::STATE_HOLD;
+}
+
+/* One capable_control_status sample (FLY and HOLD ticks); also feeds the achieved torque to compensate(). */
+void CapableControl::publish_status(hrt_abstime now, double t_fly, double dt, bool pursuit, const V3 &p, const V3 &v,
+				    const Quat &q, const V3 &w, const Ref &ref, const V3 &a_raw, const ControlOutput &out,
+				    const V3 &tau_cmd, const V3 &tau_inj, const float u[4], const float u_raw[4], bool sat_mixer,
+				    float out_scale, bool thr_capped, uint32_t compute_us)
+{
+	using S = capable_control_status_s;
+	S s{};
+	s.timestamp_sample = now;
+	s.state = _state;
+	s.state_source = _use_ground_truth ? S::SOURCE_GROUND_TRUTH : S::SOURCE_EKF;
+	s.pursuit = pursuit;
+	s.upright = _upright;
+	s.phase = ref.phase;
+	s.t_fly = (float)t_fly;
+	s.dt = (float)(_rate_ff ? dt : 0.0);
+
+	for (int i = 0; i < 3; i++) {
+		s.pos[i] = p(i); s.vel[i] = v(i); s.rates[i] = w(i);
+		s.pos_ref[i] = ref.p(i); s.vel_ref[i] = ref.v(i); s.acc_ref[i] = ref.a(i);
+		s.acc_cmd_raw[i] = a_raw(i); s.acc_cmd[i] = out.commanded_acceleration(i);
+		s.acc_des[i] = out.desired_acceleration(i); s.e_r[i] = out.e_r(i);
+		s.omega_ff[i] = _controller.omega_des_filtered()(i); s.omega_des[i] = out.omega_desired(i);
+		s.torque[i] = out.body_torque(i);
+	}
+
+	s.q[0] = q.w; s.q[1] = q.x; s.q[2] = q.y; s.q[3] = q.z;
+	const Quat &qd = out.desired_quaternion;
+	s.q_des[0] = qd.w; s.q_des[1] = qd.x; s.q_des[2] = qd.y; s.q_des[3] = qd.z;
+	s.yaw_ref = ref.yaw;
+	const Quat qe = multiply(conjugate(q), qd);
+	s.att_err = (float)(2.0 * acos(fmin(1.0, fabs(qe.w))));
+	s.tilt = (float)acos(fmin(fmax(to_rotation_matrix(q)(2, 2), -1.0), 1.0));
+	s.tilt_cmd = (float)out.tilt_rad;
+	s.thrust = out.collective_thrust;
+	V3 torque_ach_frd;
+	wrench(u, s.thrust_ach, torque_ach_frd);
+	const V3 torque_ach = to_frd(torque_ach_frd);   // same flip maps back to FLU
+
+	compensate_post(torque_ach);
+
+	for (int i = 0; i < 3; i++) { s.torque_ach[i] = torque_ach(i); s.torque_cmd[i] = tau_cmd(i); s.torque_inj[i] = tau_inj(i); }
+
+	s.att_mode = (uint8_t)_att_mode;
+	s.ref_only = _requested.ref_only;
+	s.virtual_translation = _requested.virt;
+	s.output_scale = out_scale;
+	s.thrust_capped = thr_capped;
+
+	for (int i = 0; i < 4; i++) { s.u[i] = u[i]; s.u_raw[i] = u_raw[i]; }
+
+	s.sat_accel = out.saturated_accel;
+	s.sat_thrust = out.saturated_thrust;
+	s.sat_mixer = sat_mixer;
+	s.sat_mixer_paper = out.saturated_mixer;
+	s.compute_us = compute_us;
+	s.timestamp = hrt_absolute_time();
+	_status_pub.publish(s);
 }
 
 // ---------------------------------------------------------------- main loop
@@ -517,7 +607,7 @@ void CapableControl::Run()
 			_unregister_pub.publish(u);
 		}
 
-		exit_and_cleanup();
+		exit_and_cleanup(desc);
 		return;
 	}
 
@@ -539,6 +629,16 @@ void CapableControl::Run()
 	}
 
 	_vehicle_status_sub.update(&_vehicle_status);
+
+	// The commander resets a mode's setpoint type to its default (trajectory: PX4's controllers and allocator on)
+	// whenever the mode is deactivated. Set direct actuators again ahead of the next activation, and on it.
+	const bool config_in_mode = _vehicle_status.nav_state == _mode_id;
+
+	if ((config_in_mode && !_config_in_mode) || (!config_in_mode && hrt_elapsed_time(&_last_config_publish) > 500_ms)) {
+		configure_mode();
+	}
+
+	_config_in_mode = config_in_mode;
 	_attitude_sub.update(&_attitude);
 	_local_position_sub.update(&_local_position);
 	_gt_attitude_sub.update(&_gt_attitude);
@@ -576,6 +676,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			if (!load_vehicle()) { _state = S::STATE_ABORTED; CC_ABORT("vehicle/mixer params"); break; }
 
 			_use_ground_truth = _requested_ground_truth;
+			_handing_back = false;
 
 			if (_use_ground_truth && (_truth_src == 1 ? _visual_odometry.timestamp : _gt_attitude.timestamp) == 0) {
 				_state = S::STATE_ABORTED;
@@ -609,20 +710,41 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			_sysid_t0 = -1.0;
 			_last_sample = 0;
 			_engaged_at = now;
-			// collective of the stock controller just before the switch: the rig ramp starts from it
+			_t_fly0 = now;
+			_handing_back = false;
+			// collective of the stock controller just before the switch: the ramp (rig) or blend (free flight) starts from it
 			actuator_motors_s am{};
 			_engage_thrust = 0.0;
+			float u_stock[4] {};
 
 			if (_actuator_motors_sub.copy(&am)) {
-				for (int i = 0; i < 4; i++) { if (PX4_ISFINITE(am.control[i])) { _engage_thrust += fmax(0.0, (double)am.control[i]); } }
+				for (int i = 0; i < 4; i++) {
+					if (PX4_ISFINITE(am.control[i])) {
+						u_stock[i] = am.control[i];
+						_engage_thrust += fmax(0.0, (double)am.control[i]);
+					}
+				}
 			}
 
 			_engage_thrust *= (double)_f_max;
+			// PX4's allocator has stopped: repeat its last command for this tick, the hold controller runs from the next
+			publish_motors(u_stock);
 			_state = S::STATE_HOLD;
 			mavlink_vasprintf(_MSG_PRIO_INFO, &_mavlink_log_pub, "Capable Control: holding %s, ready for fly commands",
 					  _rig ? "level" : "position");
 			PX4_INFO("CAPABLE_HOLD: switched in, holding %s, yaw %.1f deg, from %.1f N; ready for fly commands",
 				 _rig ? "level (rig, attitude only)" : "this position", _hold_yaw * 57.29578, _engage_thrust);
+
+		} else if (in_mode && armed && now - _last_command > 500_ms) {
+			// In this mode but not flying it (the switch-in failed): nothing drives the motors. Free flight: ask for
+			// Position mode (read live: _rig is only latched by a successful load).
+			int32_t rig = 0;
+			param_get(param_find("CC_RIG_EN"), &rig);
+
+			if (rig != 1) {
+				_last_command = now;
+				send_command(vehicle_command_s::VEHICLE_CMD_SET_NAV_STATE, (float)vehicle_status_s::NAVIGATION_STATE_POSCTL);
+			}
 		}
 
 		break;
@@ -690,6 +812,13 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			read_state(rates, p, v, q, w);
 
 			if (const char *why = state_stale(now)) {
+				if (!_rig) {
+					hand_back(p, q);
+					publish_motors(_last_u);
+					CC_ABORT("%s: handing back to Position mode", why);
+					break;
+				}
+
 				publish_motors(zero); _state = S::STATE_DISARMING; _last_command = 0;
 				CC_ABORT("%s", why);
 				break;
@@ -700,6 +829,8 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 				CC_ABORT("rig limit: %s", why);
 				break;
 			}
+
+			const V3 p_meas = p;
 
 			if (_requested.virt && _virt_init) { p = _vp; v = _vv; }   // Stage B: (5.8) sees the virtual vehicle
 
@@ -724,6 +855,15 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 				} else if (!_requested.ref_only && (p - _scenario.ref(_scenario.duration()).p).norm() > 5.0) {
 					// (attitude-only -F flights have no position loop: their position is not checked)
 					// Did not end near its end point (crashed / ran away): do not chain the next test from here.
+					// Free flight: hold here and hand back to PX4; the rig stops.
+					if (!_rig) {
+						const double miss = (p - _scenario.ref(_scenario.duration()).p).norm();
+						hand_back(p_meas, q);
+						CC_ABORT("ended %.1f m from the end point: holding, handing back to Position mode", miss);
+						publish_motors(_last_u);   // HOLD takes over from the next tick
+						break;
+					}
+
 					publish_motors(zero);
 					_state = S::STATE_DISARMING;
 					_last_command = 0;
@@ -740,6 +880,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 						 _hold_p(0), _hold_p(1), _hold_p(2));
 					end_test(true, "%s complete (%.1f s), holding %s, ready for the next command",
 						 scenario_name(_requested.type), t_fly, _requested.ref_only ? "level" : "position");
+					publish_motors(_last_u);   // HOLD takes over from the next tick
 				}
 
 				break;
@@ -806,7 +947,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			double thrust_cmd = out.collective_thrust;
 			float out_scale;
 			bool thr_capped;
-			rig_limit(thrust_cmd, tau_cmd, (now - _engaged_at) * 1e-6, out_scale, thr_capped);
+			limit_output(thrust_cmd, tau_cmd, (now - _engaged_at) * 1e-6, out_scale, thr_capped);
 			float u[4], u_raw[4];
 			bool sat_mixer;
 			mix(thrust_cmd, to_frd(tau_cmd), u, u_raw, sat_mixer);
@@ -816,69 +957,31 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			publish_motors(u);
 			publish_setpoints(out.desired_quaternion, out.omega_desired, thrust_cmd, _requested.ref_only ? nullptr : &ref);
 			const uint32_t compute_us = (uint32_t)(hrt_absolute_time() - t_start);
-
-			// ---- log everything for this tick
-			S s{};
-			s.timestamp_sample = now;
-			s.state = _state;
-			s.state_source = _use_ground_truth ? S::SOURCE_GROUND_TRUTH : S::SOURCE_EKF;
-			s.pursuit = pursuit_now;
-			s.upright = _upright;
-			s.phase = ref.phase;
-			s.t_fly = (float)t_fly;
-			s.dt = (float)(_rate_ff ? dt : 0.0);
-
-			for (int i = 0; i < 3; i++) {
-				s.pos[i] = p(i); s.vel[i] = v(i); s.rates[i] = w(i);
-				s.pos_ref[i] = ref.p(i); s.vel_ref[i] = ref.v(i); s.acc_ref[i] = ref.a(i);
-				s.acc_cmd_raw[i] = a_raw(i); s.acc_cmd[i] = out.commanded_acceleration(i);
-				s.acc_des[i] = out.desired_acceleration(i); s.e_r[i] = out.e_r(i);
-				s.omega_ff[i] = _controller.omega_des_filtered()(i); s.omega_des[i] = out.omega_desired(i);
-				s.torque[i] = out.body_torque(i);
-			}
-
-			s.q[0] = q.w; s.q[1] = q.x; s.q[2] = q.y; s.q[3] = q.z;
-			const Quat &qd = out.desired_quaternion;
-			s.q_des[0] = qd.w; s.q_des[1] = qd.x; s.q_des[2] = qd.y; s.q_des[3] = qd.z;
-			s.yaw_ref = ref.yaw;
-			const Quat qe = multiply(conjugate(q), qd);
-			s.att_err = (float)(2.0 * acos(fmin(1.0, fabs(qe.w))));
-			s.tilt = (float)acos(fmin(fmax(to_rotation_matrix(q)(2, 2), -1.0), 1.0));
-			s.tilt_cmd = (float)out.tilt_rad;
-			s.thrust = out.collective_thrust;
-			V3 torque_ach_frd;
-			wrench(u, s.thrust_ach, torque_ach_frd);
-			const V3 torque_ach = to_frd(torque_ach_frd);   // same flip maps back to FLU
-
-			compensate_post(torque_ach);
-
-			for (int i = 0; i < 3; i++) { s.torque_ach[i] = torque_ach(i); s.torque_cmd[i] = tau_cmd(i); s.torque_inj[i] = tau_inj(i); }
-
-			s.att_mode = (uint8_t)_att_mode;
-			s.ref_only = _requested.ref_only;
-			s.virtual_translation = _requested.virt;
-			s.output_scale = out_scale;
-			s.thrust_capped = thr_capped;
-
-			for (int i = 0; i < 4; i++) { s.u[i] = u[i]; s.u_raw[i] = u_raw[i]; }
-
-			s.sat_accel = out.saturated_accel;
-			s.sat_thrust = out.saturated_thrust;
-			s.sat_mixer = sat_mixer;
-			s.sat_mixer_paper = out.saturated_mixer;
-			s.compute_us = compute_us;
-			s.timestamp = hrt_absolute_time();
-			_status_pub.publish(s);
+			publish_status(now, t_fly, dt, pursuit_now, p, v, q, w, ref, a_raw, out, tau_cmd, tau_inj, u, u_raw, sat_mixer,
+				       out_scale, thr_capped, compute_us);
 			break;
 		}
 
 	case S::STATE_HOLD: {
-			// Hover at the end point of the last scenario (position loop on, nothing logged) until the
+			// Hover at the end point of the last scenario (position loop on, logged as PHASE_HOLD_IDLE) until the
 			// next fly request, which starts from here instead of from the ground.
 			if (!in_mode || !armed) {
 				_state = S::STATE_ABORTED;
+
+				if (_handing_back) {
+					_handing_back = false;
+					PX4_INFO("CAPABLE_HANDBACK: PX4 has the vehicle (nav_state %d, arming %d)",
+						 (int)_vehicle_status.nav_state, (int)_vehicle_status.arming_state);
+					break;
+				}
+
 				CC_ABORT("left mode or disarmed while holding");
 				break;
+			}
+
+			if (_handing_back && now - _last_command > 500_ms) {
+				_last_command = now;
+				send_command(vehicle_command_s::VEHICLE_CMD_SET_NAV_STATE, (float)vehicle_status_s::NAVIGATION_STATE_POSCTL);
 			}
 
 			V3 p, v, w;
@@ -886,6 +989,16 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			read_state(rates, p, v, q, w);
 
 			if (const char *why = state_stale(now)) {
+				if (!_rig) {
+					if (!_handing_back) {
+						hand_back(_hold_p, q);
+						CC_ABORT("%s: handing back to Position mode", why);
+					}
+
+					publish_motors(_last_u);   // nothing better to fly on until PX4 takes over
+					break;
+				}
+
 				publish_motors(zero); _state = S::STATE_DISARMING; _last_command = 0;
 				CC_ABORT("%s", why);
 				break;
@@ -901,7 +1014,10 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 
 			if (hold_virtual) { p = _vp; v = _vv; }
 
-			if (_fly_requested.load()) {
+			if (_fly_requested.load() && _handing_back) {
+				_fly_requested.store(false);   // custom_command refuses it too; the vehicle is going back to PX4
+
+			} else if (_fly_requested.load()) {
 				_fly_requested.store(false);
 
 				if (!load_vehicle()) { _state = S::STATE_ABORTED; CC_ABORT("vehicle/mixer params"); break; }
@@ -941,34 +1057,36 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 						 _scenario.center()(2));
 				}
 
+				publish_motors(_last_u);   // FLY takes over from the next tick
 				break;
 			}
 
 			const double dt = _last_sample ? (now - _last_sample) * 1e-6 : 0.0;
 			_last_sample = now;
+			const hrt_abstime t_start = hrt_absolute_time();
 			// After an attitude-only (-F) flight, hold level at hover thrust: no position to hold on the rig.
 			const V3 vzero{};
+			V3 a_raw{};
 			const ControlOutput out = _requested.ref_only
 						  ? _controller.attitude_and_thrust(V3(), q, w, _hold_yaw, &vzero, _rate_ff ? dt : 0.0)
-						  : _controller.compute(p, v, q, w, _hold_p, V3(), V3(), _hold_yaw, _rate_ff ? dt : 0.0);
+						  : _controller.compute(p, v, q, w, _hold_p, V3(), V3(), _hold_yaw, _rate_ff ? dt : 0.0, &a_raw);
 
 			if (hold_virtual && dt > 0.0) { virtual_step(q, out.collective_thrust, dt); }
 			V3 tau_cmd = compensate(out.body_torque, w, dt);
 			double thrust_cmd = out.collective_thrust;
 			float out_scale;
 			bool thr_capped;
-			rig_limit(thrust_cmd, tau_cmd, (now - _engaged_at) * 1e-6, out_scale, thr_capped);
+			limit_output(thrust_cmd, tau_cmd, (now - _engaged_at) * 1e-6, out_scale, thr_capped);
 			float u[4], u_raw[4];
 			bool sat_mixer;
 			mix(thrust_cmd, to_frd(tau_cmd), u, u_raw, sat_mixer);
 			publish_motors(u);
 			capable::Ref hold_ref{};
-			hold_ref.p = _hold_p; hold_ref.yaw = _hold_yaw;
+			hold_ref.p = _hold_p; hold_ref.yaw = _hold_yaw; hold_ref.phase = S::PHASE_HOLD_IDLE;
 			publish_setpoints(out.desired_quaternion, out.omega_desired, thrust_cmd, _requested.ref_only ? nullptr : &hold_ref);
-			double thr_ach;
-			V3 tq_frd;
-			wrench(u, thr_ach, tq_frd);
-			compensate_post(to_frd(tq_frd));
+			const uint32_t compute_us = (uint32_t)(hrt_absolute_time() - t_start);
+			publish_status(now, (now - _t_fly0) * 1e-6, dt, false, p, v, q, w, hold_ref, a_raw, out, tau_cmd, V3(), u, u_raw,
+				       sat_mixer, out_scale, thr_capped, compute_us);
 			break;
 		}
 
@@ -995,8 +1113,8 @@ int CapableControl::task_spawn(int argc, char *argv[])
 	CapableControl *instance = new CapableControl();
 
 	if (instance) {
-		_object.store(instance);
-		_task_id = task_id_is_work_queue;
+		desc.object.store(instance);
+		desc.task_id = task_id_is_work_queue;
 
 		if (instance->init()) { return PX4_OK; }
 
@@ -1005,17 +1123,17 @@ int CapableControl::task_spawn(int argc, char *argv[])
 	}
 
 	delete instance;
-	_object.store(nullptr);
-	_task_id = -1;
+	desc.object.store(nullptr);
+	desc.task_id = -1;
 	return PX4_ERROR;
 }
 
 int CapableControl::custom_command(int argc, char *argv[])
 {
-	if (!is_running()) { return print_usage("not running"); }
+	if (!is_running(desc)) { return print_usage("not running"); }
 
 	if (argc >= 2 && !strcmp(argv[0], "fly")) {
-		CapableControl *self = get_instance();
+		CapableControl *self = get_instance<CapableControl>(desc);
 		capable::Scenario::Options o{};
 		bool rate_ff = true;
 		bool ground_truth = false;
@@ -1079,7 +1197,18 @@ int CapableControl::custom_command(int argc, char *argv[])
 			return 1;
 		}
 
+		// Free flight: -F and -V have no position loop, the vehicle would fly away at the reference acceleration.
+		if (rig != 1 && (o.ref_only || o.virt)) {
+			PX4_ERR("-F and -V are rig tests (CC_RIG_EN 1): no position loop in free flight");
+			return 1;
+		}
+
 #endif
+
+		if (self->_handing_back) {
+			PX4_ERR("handing back to PX4 after an abort: switch out of and back into Capable Control on the RC first");
+			return 1;
+		}
 		self->_requested = o;
 		self->_rate_ff = rate_ff;
 		self->_requested_ground_truth = ground_truth;
@@ -1196,5 +1325,5 @@ $ capable_control fly circle -g 4 -v 20 -r 3 -y velocity
 
 extern "C" __EXPORT int capable_control_main(int argc, char *argv[])
 {
-	return CapableControl::main(argc, argv);
+	return ModuleBase::main(CapableControl::desc, argc, argv);
 }

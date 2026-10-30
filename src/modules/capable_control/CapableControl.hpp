@@ -33,6 +33,7 @@
 #include <uORB/topics/capable_control_status.h>
 #include <uORB/topics/register_ext_component_reply.h>
 #include <uORB/topics/register_ext_component_request.h>
+#include <uORB/topics/setpoint_config.h>
 #include <uORB/topics/unregister_ext_component.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
@@ -40,7 +41,6 @@
 #include <uORB/topics/vehicle_local_position_setpoint.h>
 #include <uORB/topics/vehicle_rates_setpoint.h>
 #include <uORB/topics/vehicle_command.h>
-#include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_odometry.h>
 #include <uORB/topics/vehicle_status.h>
@@ -49,9 +49,11 @@
 
 using namespace time_literals;
 
-class CapableControl : public ModuleBase<CapableControl>, public ModuleParams, public px4::WorkItem
+class CapableControl : public ModuleBase, public ModuleParams, public px4::WorkItem
 {
 public:
+	static Descriptor desc;
+
 	CapableControl();
 	~CapableControl() override;
 
@@ -74,6 +76,11 @@ private:
 
 	void control_tick(const vehicle_angular_velocity_s &rates);
 	void publish_motors(const float u[4]);
+	void publish_status(hrt_abstime now, double t_fly, double dt, bool pursuit, const capable::V3 &p, const capable::V3 &v,
+			    const capable::Quat &q, const capable::V3 &w, const capable::Ref &ref, const capable::V3 &a_raw,
+			    const capable::ControlOutput &out, const capable::V3 &tau_cmd, const capable::V3 &tau_inj,
+			    const float u[4], const float u_raw[4], bool sat_mixer, float out_scale, bool thr_capped,
+			    uint32_t compute_us);
 
 	// Vehicle model (CC_* params) and mixer from CA_ROTOR* geometry (physical units),
 	// per-rotor max thrust CC_ROT_FMAX and thrust curve CC_THR_MODEL.
@@ -103,7 +110,7 @@ private:
 	orb_advert_t _mavlink_log_pub{nullptr};   // QGC messages
 	uORB::Publication<register_ext_component_request_s> _register_request_pub{ORB_ID(register_ext_component_request)};
 	uORB::Publication<unregister_ext_component_s> _unregister_pub{ORB_ID(unregister_ext_component)};
-	uORB::Publication<vehicle_control_mode_s> _config_control_setpoints_pub{ORB_ID(config_control_setpoints)};
+	uORB::Publication<setpoint_config_s> _setpoint_config_pub{ORB_ID(setpoint_config)};
 	uORB::Publication<arming_check_reply_s> _arming_check_reply_pub{ORB_ID(arming_check_reply)};
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 
@@ -133,6 +140,7 @@ private:
 	int8_t _mode_id{-1};
 	int8_t _arming_check_id{-1};
 	hrt_abstime _last_config_publish{0};
+	bool _config_in_mode{false};
 
 	// flight
 	capable::CapableFlightController _controller{capable::chaser()};
@@ -179,8 +187,14 @@ private:
 	bool _rig_yaw{true};    // CC_RIG_YAW: false = yaw axis locked on the rig, no yaw torque
 	double _rig_thr{0.35}, _rig_tilt{60.0}, _rig_rate{360.0}, _rig_ramp{2.0};
 	hrt_abstime _engaged_at{0};
-	double _engage_thrust{-1.0};   // [N] collective at an RC switch-in (rig: blended from it, torque not scaled); -1: soft start from 0
+	double _engage_thrust{-1.0};   // [N] collective at an RC switch-in (blended from it, torque not scaled); -1: rig soft start from 0
+	double _eng_ramp{1.0};         // CC_ENG_RAMP [s]: free-flight blend from _engage_thrust
 	bool _prev_in_mode_armed{false};
+	// Free flight: a test that cannot go on hands the vehicle back to PX4 (Position mode) instead of stopping the
+	// motors in the air. It holds here meanwhile (with a stale state: repeats the last motor command).
+	bool _handing_back{false};
+	float _last_u[4] {};
+	void hand_back(const capable::V3 &p, const capable::Quat &q);
 	const char *rig_violation(const capable::Quat &q, const capable::V3 &w) const;
 	const char *state_stale(hrt_abstime now) const;
 	void print_params() const;
@@ -194,7 +208,7 @@ private:
 		_vp = p; _vv = v; _v_thrust = thrust; _v_ground = ground; _virt_init = true;
 	}
 	void virtual_step(const capable::Quat &q, double thrust, double dt);
-	void rig_limit(double &thrust, capable::V3 &torque, double now_s, float &scale, bool &capped) const;
+	void limit_output(double &thrust, capable::V3 &torque, double now_s, float &scale, bool &capped) const;
 	capable::V3 sysid_injection(double t);
 	capable::V3 compensate(const capable::V3 &tau_paper, const capable::V3 &w, double dt);
 	void compensate_post(const capable::V3 &tau_ach) { _tau_ach_prev = tau_ach; }

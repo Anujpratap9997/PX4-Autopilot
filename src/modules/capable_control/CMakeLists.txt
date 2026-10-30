@@ -6,6 +6,8 @@ px4_add_module(
 		CapableControl.hpp
 		CapableFlightController.hpp
 		Scenarios.hpp
+	MODULE_CONFIG
+		capable_control_params.yaml
 	DEPENDS
 		px4_work_queue
 	)

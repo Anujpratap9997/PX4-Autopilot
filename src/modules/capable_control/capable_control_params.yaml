@@ -1,0 +1,240 @@
+module_name: capable_control
+parameters:
+- group: Capable Control
+  definitions:
+    CC_MASS:
+      description:
+        short: Vehicle model and gains for capable_control. Defaults = MATH_Rishabh.pdf Table II chaser.
+        long: |-
+          Read once when a flight is requested (`capable_control fly ...`).
+          Rotor geometry comes from CA_ROTOR_COUNT / CA_ROTORi_PX / PY / KM, which must be in physical
+          units (metres, moment/thrust ratio in metres) in the airframe.
+          /
+
+          /**
+          Vehicle mass
+      type: float
+      default: 3.0
+      unit: kg
+    CC_IXX:
+      description:
+        short: Inertia about body x
+      type: float
+      default: 0.025
+    CC_IYY:
+      description:
+        short: Inertia about body y
+      type: float
+      default: 0.025
+    CC_IZZ:
+      description:
+        short: Inertia about body z
+      type: float
+      default: 0.046
+    CC_ACC_MAX_G:
+      description:
+        short: Lateral acceleration limit (5.1)
+      type: float
+      default: 4.0
+    CC_TW_MAX:
+      description:
+        short: 'Thrust clip, as thrust-to-weight ratio (5.3, 5.7a)'
+      type: float
+      default: 5.5
+    CC_V_MAX:
+      description:
+        short: Speed ceiling (admissibility only)
+      type: float
+      default: 50.0
+      unit: m/s
+    CC_ATT_WN:
+      description:
+        short: Roll/pitch natural frequency (4.4)
+      type: float
+      default: 14.0
+      unit: rad/s
+    CC_ATT_ZETA:
+      description:
+        short: Roll/pitch damping ratio (4.4)
+      type: float
+      default: 0.7
+    CC_YAW_WN:
+      description:
+        short: Yaw natural frequency (4.4)
+      type: float
+      default: 6.0
+      unit: rad/s
+    CC_YAW_ZETA:
+      description:
+        short: Yaw damping ratio (4.4)
+      type: float
+      default: 0.7
+    CC_DRAG:
+      description:
+        short: Linear drag k_D used for feed-forward (5.2)
+      type: float
+      default: 0.18
+    CC_POS_KP:
+      description:
+        short: 'Position gain kp_pos (5.8), all axes. Not from the paper excerpt.'
+      type: float
+      default: 4.0
+    CC_VEL_KD:
+      description:
+        short: 'Velocity gain kd_vel (5.8), all axes. Not from the paper excerpt.'
+      type: float
+      default: 3.6
+    CC_ROT_FMAX:
+      description:
+        short: Maximum thrust of one rotor
+      type: float
+      default: 44.13
+      unit: N
+    CC_THR_MODEL:
+      description:
+        short: Thrust curve of the motor command
+        long: |-
+          0: thrust linear in the command (SIH). 1: thrust proportional to command squared
+          (command = rotor speed fraction, Gazebo / real ESCs).
+      type: enum
+      values:
+        0: Linear
+        1: Quadratic
+      default: 0
+    CC_TRUTH_SRC:
+      description:
+        short: Ground-truth source for the -t option
+        long: |-
+          0: vehicle_*_groundtruth topics (SIH, exact at the sim rate).
+          1: vehicle_visual_odometry from the Gazebo model's OdometryPublisher (gz_bridge's own
+          groundtruth is 50 Hz with Euler-difference rates, unusable for feedback).
+      type: enum
+      values:
+        0: Groundtruth topics
+        1: Visual odometry
+      default: 0
+    CC_UPRIGHT:
+      description:
+        short: Attitude regime (Sec. V-J)
+        long: |-
+          0: inverting, thrust axis anywhere on the sphere (the shared controller, unmodified).
+          1: upright, (5.9) projects a_des onto the upper half-space before (5.4), so the vehicle
+          never inverts and a downward break is capped at free fall.
+      type: enum
+      values:
+        0: Inverting
+        1: Upright
+      default: 0
+    CC_ATT_MODE:
+      description:
+        short: Attitude torque law (motor-lag study)
+        long: |-
+          0: the paper's (5.7b), unmodified. 1: (5.7b) followed by a motor-lag lead
+          (T_m s + 1)/(T_c s + 1). 2: incremental (INDI) form of (5.7b): tau = tau_hat + J (alpha_des - wdot_hat),
+          alpha_des = (5.7b)/J, tau_hat = motor model (T_m) of the achieved torque, both filtered by T_c.
+          3: mode 2 followed by the mode-1 lead.
+      type: enum
+      values:
+        0: Paper
+        1: Lead
+        2: INDI
+        3: INDI + lead
+      default: 0
+    CC_MOT_TAU:
+      description:
+        short: Motor time constant used by CC_ATT_MODE 1/2
+      type: float
+      default: 0.055
+      unit: s
+      min: 0.001
+      max: 0.5
+      decimal: 3
+    CC_COMP_TAU:
+      description:
+        short: 'Compensation filter time constant (lead pole for mode 1, measurement filter for mode 2)'
+      type: float
+      default: 0.015
+      unit: s
+      min: 0.001
+      max: 0.2
+      decimal: 3
+    CC_RIG_EN:
+      description:
+        short: Rig mode (static 3-DOF test rig)
+        long: |-
+          Enables the CC_RIG_* safety limits: collective cap, tilt and rate cutoffs, soft start.
+          0 for simulation and free flight.
+      type: boolean
+      default: 0
+    CC_RIG_THR:
+      description:
+        short: 'Rig: collective thrust cap, fraction of the maximum total thrust'
+        long: |-
+          On the rig thrust does not move the vehicle; only differential thrust matters. The cap keeps
+          the bearing load and the energy in the props low.
+      type: float
+      default: 0.35
+      min: 0.05
+      max: 1.0
+      decimal: 2
+    CC_RIG_TILT:
+      description:
+        short: 'Rig: tilt cutoff'
+        long: |-
+          Motors off and disarm when the tilt exceeds this angle (set it inside the rig's mechanical range).
+      type: float
+      default: 60.0
+      unit: deg
+      min: 5
+      max: 180
+    CC_RIG_RATE:
+      description:
+        short: 'Rig: body-rate cutoff'
+        long: |-
+          Motors off and disarm when any body rate exceeds this value.
+      type: float
+      default: 360.0
+      unit: deg/s
+      min: 30
+      max: 2000
+    CC_RIG_RAMP:
+      description:
+        short: 'Rig: soft-start time'
+        long: |-
+          Thrust and torque are scaled from 0 to 1 over this time after the mode engages.
+      type: float
+      default: 2.0
+      unit: s
+      min: 0
+      max: 10
+      decimal: 1
+    CC_ENG_RAMP:
+      description:
+        short: 'Free flight: collective blend time at an RC switch-in'
+        long: |-
+          The collective is blended from the stock controller's one (just before the switch) to this module's over this
+          time, so an error in CC_MASS, CC_ROT_FMAX or THR_MDL_FAC does not step the thrust; the torque acts at once.
+          0: no blend. Free flight only (CC_RIG_EN 0); the rig uses CC_RIG_RAMP.
+      type: float
+      default: 1.0
+      unit: s
+      min: 0
+      max: 5
+      decimal: 1
+    CC_RIG_YAW:
+      description:
+        short: 'Rig: yaw axis controlled'
+        long: |-
+          0 when the rig's yaw axis is locked (stoppers): the module then commands no yaw torque, so the
+          whole motor range is left for roll and pitch (stock PX4 equivalent: MC_YAWRATE_K 0). Rig mode only.
+      type: boolean
+      default: 1
+    CC_AUTOSTART:
+      description:
+        short: Start capable_control at boot
+        long: |-
+          1: the module starts with the multicopter apps and registers the Capable Control mode (External Mode 1,
+          COM_FLTMODEx 100), so it can be put on the RC flight mode switch. 0: start it by hand (capable_control start).
+      type: boolean
+      default: 0
+      reboot_required: true
