@@ -16,6 +16,7 @@
 #include <unistd.h>
 #endif
 
+#include <cstdlib>
 #include <cstring>
 
 using namespace capable;
@@ -31,7 +32,7 @@ inline Quat quat_to_zup(const float q[4]) { return Quat{q[0], q[1], -q[2], -q[3]
 
 const char *scenario_name(int type)
 {
-	static const char *const names[] = {"hover", "translate", "circle", "pursuit", "dive", "sysid", "tilt"};
+	static const char *const names[] = {"hover", "translate", "circle", "pursuit", "dive", "sysid", "tilt", "accel"};
 	return type >= 0 && type < (int)(sizeof(names) / sizeof(names[0])) ? names[type] : "test";
 }
 }
@@ -101,7 +102,8 @@ static constexpr const char *CC_PARAMS[] = {
 	"CC_MASS", "CC_IXX", "CC_IYY", "CC_IZZ", "CC_ACC_MAX_G", "CC_TW_MAX", "CC_V_MAX", "CC_ATT_WN", "CC_ATT_ZETA",
 	"CC_YAW_WN", "CC_YAW_ZETA", "CC_DRAG", "CC_POS_KP", "CC_VEL_KD", "CC_ROT_FMAX", "CC_THR_MODEL", "CC_TRUTH_SRC",
 	"CC_UPRIGHT", "CC_ATT_MODE", "CC_MOT_TAU", "CC_COMP_TAU", "CC_RIG_EN", "CC_RIG_THR", "CC_RIG_TILT",
-	"CC_RIG_RATE", "CC_RIG_RAMP", "CC_RIG_YAW", "CC_ENG_RAMP"
+	"CC_RIG_RATE", "CC_RIG_RAMP", "CC_RIG_YAW", "CC_ENG_RAMP", "CC_DOB_EN", "CC_DOB_TAU", "CC_DOB_MTAU",
+	"CC_DOB_MAXG", "CC_DOB_TFRAC"
 };
 
 /* CAPABLE_PARAMS lines: name=value (without CC_), float32 values exact (%.9g); rig_log.py reads them. */
@@ -242,6 +244,15 @@ static float get_param_f(const char *name, bool &ok)
 bool CapableControl::load_vehicle()
 {
 	bool ok = true;
+	// Reloading the parameters rebuilds the controller below, which would also throw away the disturbance
+	// the observer has learnt. A fly continuing from a hover keeps it, so the test does not start by
+	// re-learning the same mass error; a fresh engagement or a flight from the ground calls reset_dob().
+	V3 keep_d_perp{};
+	double keep_d_thrust = 0.0;
+	const bool keep_dob = _dob_en && _state == capable_control_status_s::STATE_HOLD;
+
+	if (keep_dob) { _controller.get_dob_estimate(keep_d_perp, keep_d_thrust); }
+
 	// --- vehicle model and gains (defaults = Table II chaser)
 	Capability c = capable::chaser();
 	c.mass = get_param_f("CC_MASS", ok);
@@ -279,6 +290,16 @@ bool CapableControl::load_vehicle()
 	_rig_rate = get_param_f("CC_RIG_RATE", ok);
 	_rig_ramp = get_param_f("CC_RIG_RAMP", ok);
 	_eng_ramp = get_param_f("CC_ENG_RAMP", ok);
+
+	// --- (6) acceleration disturbance observer. The rig and the fake-translation tests have no physical
+	// translation to measure, so it is never enabled there whatever CC_DOB_EN says.
+	int32_t dob = 0;
+	param_get(param_find("CC_DOB_EN"), &dob);
+	_dob_en = dob == 1 && !_rig;
+	_controller.configure_dob(_dob_en, get_param_f("CC_DOB_TAU", ok), get_param_f("CC_DOB_MTAU", ok),
+				  get_param_f("CC_DOB_MAXG", ok), get_param_f("CC_DOB_TFRAC", ok), _mot_tau);
+
+	if (keep_dob && _dob_en) { _controller.set_dob_estimate(keep_d_perp, keep_d_thrust); }
 
 	// --- mixer: wrench [T; Mx; My; Mz] (FRD) = A f, column i = F_max [1, -PY_i, PX_i, KM_i]
 	// (same convention as ActuatorEffectivenessRotors with the thrust axis -z)
@@ -475,6 +496,43 @@ void CapableControl::read_state(const vehicle_angular_velocity_s &rates, V3 &p, 
 	w = to_zup(wr[0], wr[1], wr[2]);
 }
 
+/* Measurement for the (6) observer. vehicle_acceleration is the specific force in body FRD, already
+ * corrected for the calibration AND for EKF2's estimated accelerometer bias, and low-passed at
+ * IMU_ACCEL_CUTOFF (sensors/vehicle_acceleration). Rotating it with the attitude the controller is flying
+ * on and removing gravity gives the kinematic acceleration that a_model predicts. At rest the FRD sample
+ * is (0, 0, -g), which maps to (0, 0, +g) in FLU and then to zero here.
+ *
+ * There is no groundtruth acceleration topic, so -t gets perfect state but the real IMU. */
+bool CapableControl::read_accel(hrt_abstime now, const Quat &q, V3 &a) const
+{
+	if (_acceleration.timestamp == 0 || now > _acceleration.timestamp + 100_ms) { return false; }
+
+	const V3 f_flu = to_zup(_acceleration.xyz[0], _acceleration.xyz[1], _acceleration.xyz[2]);
+
+	if (!PX4_ISFINITE(f_flu(0)) || !PX4_ISFINITE(f_flu(1)) || !PX4_ISFINITE(f_flu(2))) { return false; }
+
+	a = to_rotation_matrix(q) * f_flu - V3(0.0, 0.0, GRAVITY);
+	return true;
+}
+
+/* Where the measured acceleration is not free-flight model error, the estimate is held rather than
+ * learned: the rig's pivot and the ground reaction are not something thrust can fix, the -F / -V tests
+ * fly a reference or a virtual vehicle rather than the real one, and without a valid position estimate
+ * the EKF's accelerometer bias (which vehicle_acceleration has already subtracted) is not trustworthy. */
+bool CapableControl::dob_frozen(uint8_t phase) const
+{
+	using S = capable_control_status_s;
+
+	if (_rig || _requested.ref_only || _requested.virt) { return true; }
+
+	if (!_use_ground_truth && !(lpos().xy_valid && lpos().z_valid)) { return true; }
+
+	// PHASE_TAKEOFF is a real lift-off only from the ground; started from a hover it is an ordinary
+	// airborne transit, where the observer should go on learning.
+	return phase == S::PHASE_GROUND_SPINUP || phase == S::PHASE_LAND || phase == S::PHASE_TOUCHDOWN
+	       || (_from_ground && phase == S::PHASE_TAKEOFF);
+}
+
 void CapableControl::mix(double thrust, const V3 &torque_frd, float u[4], float u_raw[4], bool &saturated) const
 {
 	// u_raw = unclipped per-rotor thrust fraction f; u = motor command after the thrust curve.
@@ -535,7 +593,7 @@ void CapableControl::hand_back(const V3 &p, const Quat &q)
 void CapableControl::publish_status(hrt_abstime now, double t_fly, double dt, bool pursuit, const V3 &p, const V3 &v,
 				    const Quat &q, const V3 &w, const Ref &ref, const V3 &a_raw, const ControlOutput &out,
 				    const V3 &tau_cmd, const V3 &tau_inj, const float u[4], const float u_raw[4], bool sat_mixer,
-				    float out_scale, bool thr_capped, uint32_t compute_us)
+				    float out_scale, bool thr_capped, const V3 &a_meas, bool dob_held, uint32_t compute_us)
 {
 	using S = capable_control_status_s;
 	S s{};
@@ -586,6 +644,16 @@ void CapableControl::publish_status(hrt_abstime now, double t_fly, double dt, bo
 	s.sat_thrust = out.saturated_thrust;
 	s.sat_mixer = sat_mixer;
 	s.sat_mixer_paper = out.saturated_mixer;
+	s.dob = out.dob_active;
+	s.dob_frozen = dob_held;
+	s.dob_d_thrust = out.accel_disturbance_thrust;
+
+	for (int i = 0; i < 3; i++) {
+		s.acc_meas[i] = a_meas(i);
+		s.dob_model[i] = out.accel_model(i);
+		s.dob_d[i] = out.accel_disturbance(i);
+	}
+
 	s.compute_us = compute_us;
 	s.timestamp = hrt_absolute_time();
 	_status_pub.publish(s);
@@ -639,6 +707,7 @@ void CapableControl::Run()
 	}
 
 	_config_in_mode = config_in_mode;
+	_acceleration_sub.update(&_acceleration);
 	_attitude_sub.update(&_attitude);
 	_local_position_sub.update(&_local_position);
 	_gt_attitude_sub.update(&_gt_attitude);
@@ -706,6 +775,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			_home = V3(p(0), p(1), 0.0);
 			_p0 = _home;
 			_controller.reset();
+			_controller.reset_dob();   // fresh engagement: nothing learnt yet
 			_comp_init = false;
 			_sysid_t0 = -1.0;
 			_last_sample = 0;
@@ -760,12 +830,15 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			const double yaw0 = atan2(R0(1, 0), R0(0, 0));
 			_scenario.build(_requested, p0, yaw0);
 			_engage_thrust = -1.0;
+			_from_ground = true;
+			_controller.reset_dob();   // from the ground: nothing learnt yet
 			_comp_init = false;
 			_sysid_t0 = -1.0;
 			_engaged_at = now;
 			_virt_init = false;
 
 			if (_requested.virt) { virtual_init(p0, V3(), 0.0, p0(2)); }
+
 			_p0 = p0;
 			_home = p0;
 			_last_pursuit_yaw = yaw0;
@@ -802,7 +875,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			if (!in_mode || !armed) {
 				_state = S::STATE_ABORTED;
 				CC_ABORT("left mode or disarmed in flight (nav_state %d, arming %d)",
-					(int)_vehicle_status.nav_state, (int)_vehicle_status.arming_state);
+					 (int)_vehicle_status.nav_state, (int)_vehicle_status.arming_state);
 				break;
 			}
 
@@ -839,7 +912,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 
 			if (_scenario.in_pursuit(t_fly) && !pursuit_now) {
 				_scenario.append_brake_and_land(t_fly, p, v, _last_pursuit_acmd, _last_pursuit_yaw, _p0,
-								 _requested.type == capable::Scenario::DIVE ? 1.0 : 0.5);
+								_requested.type == capable::Scenario::DIVE ? 1.0 : 0.5);
 				PX4_INFO("CAPABLE_PURSUIT_END: t_fly %.3f s, speed %.2f m/s", t_fly, v.norm());
 			}
 
@@ -868,7 +941,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 					_state = S::STATE_DISARMING;
 					_last_command = 0;
 					CC_ABORT("ended %.1f m from the end point, not holding",
-						(p - _scenario.ref(_scenario.duration()).p).norm());
+						 (p - _scenario.ref(_scenario.duration()).p).norm());
 
 				} else {
 					const capable::Ref end = _scenario.ref(_scenario.duration());
@@ -889,19 +962,39 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			const double dt = _last_sample ? (now - _last_sample) * 1e-6 : 0.0;
 			_last_sample = now;
 
-			capable::Ref ref;
+			// Read once: the pursuit branches below replace it, the rest re-read the same value, and the
+			// phase is what decides whether the observer may learn this tick.
+			capable::Ref ref = _scenario.ref(t_fly);
 			const hrt_abstime t_start = hrt_absolute_time();
 			V3 a_raw;
 			ControlOutput out;
 
-			if (pursuit_now && _requested.type == capable::Scenario::DIVE) {
+			// (6) observer. dt is passed separately from the rate feed-forward's, so fly -n does not also
+			// switch the observer off; a stale or missing sample freezes it instead of feeding it garbage.
+			V3 a_meas{};
+			const bool have_accel = _dob_en && read_accel(now, q, a_meas);
+			const bool dob_freeze = dob_frozen(pursuit_now ? (uint8_t)S::PHASE_PURSUIT : ref.phase);
+			const V3 *a_meas_p = have_accel ? &a_meas : nullptr;
+			_controller.dob_freeze(dob_freeze);
+
+			if (pursuit_now && _requested.type == capable::Scenario::ACCEL) {
+				// Closed-loop acceleration test: a fixed command in the world frame, heading held, no
+				// position loop. What (6) has to hold on its own.
+				a_raw = _requested.accel_cmd;
+				ref.p = p; ref.v = v; ref.a = a_raw;
+				ref.yaw = _last_pursuit_yaw;
+				ref.phase = S::PHASE_ACCEL;
+				out = _controller.attitude_and_thrust(a_raw, q, w, ref.yaw, &v, _rate_ff ? dt : 0.0, a_meas_p, dt);
+				_last_pursuit_acmd = a_raw;
+
+			} else if (pursuit_now && _requested.type == capable::Scenario::DIVE) {
 				// Sec. V-J test: a fixed acceleration command (lat_g north, down_g down), fixed yaw,
 				// no position loop. Inverting regime rolls over to thrust down; upright caps at free fall.
 				a_raw = V3(_requested.lat_g * GRAVITY, 0.0, -_requested.down_g * GRAVITY);
 				ref.p = p; ref.v = v; ref.a = a_raw;
 				ref.yaw = _last_pursuit_yaw;
 				ref.phase = S::PHASE_DIVE;
-				out = _controller.attitude_and_thrust(a_raw, q, w, ref.yaw, &v, _rate_ff ? dt : 0.0);
+				out = _controller.attitude_and_thrust(a_raw, q, w, ref.yaw, &v, _rate_ff ? dt : 0.0, a_meas_p, dt);
 				_last_pursuit_acmd = a_raw;
 
 			} else if (pursuit_now) {
@@ -916,23 +1009,23 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 				ref.p = p; ref.v = v; ref.a = a_raw;
 				ref.yaw = sp > 0.1 ? atan2(v(1), v(0)) : _last_pursuit_yaw;
 				ref.phase = S::PHASE_PURSUIT;
-				out = _controller.attitude_and_thrust(a_raw, q, w, ref.yaw, &v, _rate_ff ? dt : 0.0);
+				out = _controller.attitude_and_thrust(a_raw, q, w, ref.yaw, &v, _rate_ff ? dt : 0.0, a_meas_p, dt);
 				_last_pursuit_acmd = a_raw;
 				_last_pursuit_yaw = ref.yaw;
 
 			} else if (_requested.ref_only) {
 				// Stage A (rig): no position loop. (5.8) is bypassed: a_cmd = a_ref, and the drag
 				// feed-forward of (5.2) uses v_ref. (5.1) to (5.7) run on the real attitude and rates.
-				ref = _scenario.ref(t_fly);
 				a_raw = ref.a;
-				out = _controller.attitude_and_thrust(ref.a, q, w, ref.yaw, &ref.v, _rate_ff ? dt : 0.0);
+				out = _controller.attitude_and_thrust(ref.a, q, w, ref.yaw, &ref.v, _rate_ff ? dt : 0.0, a_meas_p, dt);
 				_last_pursuit_yaw = ref.yaw;
 
 			} else {
-				ref = _scenario.ref(t_fly);
-				out = _controller.compute(p, v, q, w, ref.p, ref.v, ref.a, ref.yaw, _rate_ff ? dt : 0.0, &a_raw);
+				out = _controller.compute(p, v, q, w, ref.p, ref.v, ref.a, ref.yaw, _rate_ff ? dt : 0.0, &a_raw,
+							  a_meas_p, dt);
 				_last_pursuit_yaw = ref.yaw;
 			}
+
 			V3 tau_inj{};
 
 			if (ref.phase == S::PHASE_SYSID) {
@@ -951,6 +1044,10 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			float u[4], u_raw[4];
 			bool sat_mixer;
 			mix(thrust_cmd, to_frd(tau_cmd), u, u_raw, sat_mixer);
+			// The collective that limit_output() actually sent (the engage blend moves it for CC_ENG_RAMP
+			// seconds) is what the next a_model must be built from, and this vehicle's own mixer rail is a
+			// saturation like the paper plant's.
+			_controller.dob_post(thrust_cmd, sat_mixer);
 
 			if (ref.phase == S::PHASE_TOUCHDOWN) { for (float &x : u) { x = 0.f; } }
 
@@ -958,7 +1055,7 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			publish_setpoints(out.desired_quaternion, out.omega_desired, thrust_cmd, _requested.ref_only ? nullptr : &ref);
 			const uint32_t compute_us = (uint32_t)(hrt_absolute_time() - t_start);
 			publish_status(now, t_fly, dt, pursuit_now, p, v, q, w, ref, a_raw, out, tau_cmd, tau_inj, u, u_raw, sat_mixer,
-				       out_scale, thr_capped, compute_us);
+				       out_scale, thr_capped, a_meas, dob_freeze || !have_accel, compute_us);
 			break;
 		}
 
@@ -1034,9 +1131,11 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 				} else {
 					virtual_init(p, v, _mass * GRAVITY, _home(2));   // start it from the real state, hovering
 				}
+
 				const M3 R0 = to_rotation_matrix(q);
 				const double yaw0 = atan2(R0(1, 0), R0(0, 0));
 				_scenario.build(_requested, _home, yaw0, &p);
+				_from_ground = false;   // started from a hover: no ground contact, PHASE_TAKEOFF is a transit
 				_sysid_t0 = -1.0;
 				_p0 = _home;
 				_last_pursuit_yaw = yaw0;
@@ -1067,11 +1166,21 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			// After an attitude-only (-F) flight, hold level at hover thrust: no position to hold on the rig.
 			const V3 vzero{};
 			V3 a_raw{};
+			// (6) runs while holding too: hovering is where a mass or thrust-model error shows up as a
+			// steady d_hat, and the estimate is then already learnt when the next fly starts.
+			V3 a_meas{};
+			const bool have_accel = _dob_en && read_accel(now, q, a_meas);
+			const bool dob_freeze = dob_frozen((uint8_t)S::PHASE_HOLD_IDLE);
+			const V3 *a_meas_p = have_accel ? &a_meas : nullptr;
+			_controller.dob_freeze(dob_freeze);
 			const ControlOutput out = _requested.ref_only
-						  ? _controller.attitude_and_thrust(V3(), q, w, _hold_yaw, &vzero, _rate_ff ? dt : 0.0)
-						  : _controller.compute(p, v, q, w, _hold_p, V3(), V3(), _hold_yaw, _rate_ff ? dt : 0.0, &a_raw);
+						  ? _controller.attitude_and_thrust(V3(), q, w, _hold_yaw, &vzero, _rate_ff ? dt : 0.0,
+								  a_meas_p, dt)
+						  : _controller.compute(p, v, q, w, _hold_p, V3(), V3(), _hold_yaw, _rate_ff ? dt : 0.0, &a_raw,
+								  a_meas_p, dt);
 
 			if (hold_virtual && dt > 0.0) { virtual_step(q, out.collective_thrust, dt); }
+
 			V3 tau_cmd = compensate(out.body_torque, w, dt);
 			double thrust_cmd = out.collective_thrust;
 			float out_scale;
@@ -1080,13 +1189,14 @@ void CapableControl::control_tick(const vehicle_angular_velocity_s &rates)
 			float u[4], u_raw[4];
 			bool sat_mixer;
 			mix(thrust_cmd, to_frd(tau_cmd), u, u_raw, sat_mixer);
+			_controller.dob_post(thrust_cmd, sat_mixer);
 			publish_motors(u);
 			capable::Ref hold_ref{};
 			hold_ref.p = _hold_p; hold_ref.yaw = _hold_yaw; hold_ref.phase = S::PHASE_HOLD_IDLE;
 			publish_setpoints(out.desired_quaternion, out.omega_desired, thrust_cmd, _requested.ref_only ? nullptr : &hold_ref);
 			const uint32_t compute_us = (uint32_t)(hrt_absolute_time() - t_start);
 			publish_status(now, (now - _t_fly0) * 1e-6, dt, false, p, v, q, w, hold_ref, a_raw, out, tau_cmd, V3(), u, u_raw,
-				       sat_mixer, out_scale, thr_capped, compute_us);
+				       sat_mixer, out_scale, thr_capped, a_meas, dob_freeze || !have_accel, compute_us);
 			break;
 		}
 
@@ -1140,34 +1250,94 @@ int CapableControl::custom_command(int argc, char *argv[])
 		double sysid_scale = 1.0;
 
 		if (!strcmp(argv[1], "hover")) { o.type = capable::Scenario::HOVER; }
+
 		else if (!strcmp(argv[1], "translate")) { o.type = capable::Scenario::TRANSLATE; }
+
 		else if (!strcmp(argv[1], "circle")) { o.type = capable::Scenario::CIRCLE; }
+
 		else if (!strcmp(argv[1], "pursuit")) { o.type = capable::Scenario::PURSUIT; }
+
 		else if (!strcmp(argv[1], "sysid")) { o.type = capable::Scenario::SYSID; }
+
 		else if (!strcmp(argv[1], "tilt")) { o.type = capable::Scenario::TILT; o.turn_time = 2.0; }
+
 		else if (!strcmp(argv[1], "dive")) { o.type = capable::Scenario::DIVE; o.turn_time = 1.0; o.altitude = 100.0; }
+
+		else if (!strcmp(argv[1], "accel")) { o.type = capable::Scenario::ACCEL; o.turn_time = 3.0; o.altitude = 30.0; }
+
 		else { return print_usage("unknown scenario"); }
 
 		int myoptind = 2, ch;
 		const char *myoptarg = nullptr;
 
+		if (o.type == capable::Scenario::ACCEL) {
+			// fly accel ax,ay,az: the command itself, in m/s^2 and NWU, as a positional argument before the
+			// options. Not in g, unlike -g / -d / -l, so it matches the Python bench's --accel. Commas and
+			// spaces separate equally, so "5,0,0", "5, 0, 0" and "5 0 0" all work.
+			double a[3] {};
+			int got = 0;
+
+			while (got < 3 && myoptind < argc) {
+				const char *s = argv[myoptind];
+
+				// A leading '-' is an option unless a digit or a point follows it: no option is a number,
+				// so "-2" is the component and "-T" ends the vector.
+				if (s[0] == '-' && !((s[1] >= '0' && s[1] <= '9') || s[1] == '.')) { break; }
+
+				while (got < 3 && *s != '\0') {
+					char *end = nullptr;
+					const double value = strtod(s, &end);
+
+					if (end == s) { break; }
+
+					a[got++] = value;
+					s = end;
+
+					while (*s == ',' || *s == ' ') { s++; }
+				}
+
+				myoptind++;
+			}
+
+			if (got != 3) {
+				return print_usage("fly accel needs ax,ay,az in m/s^2, e.g. fly accel 5,0,0 -T 3");
+			}
+
+			o.accel_cmd = V3(a[0], a[1], a[2]);
+		}
+
 		while ((ch = px4_getopt(argc, argv, "g:v:r:y:a:T:d:l:R:A:ntLFV", &myoptind, &myoptarg)) != EOF) {
 			switch (ch) {
 			case 'd': o.down_g = atof(myoptarg); break;
+
 			case 'l': o.lat_g = atof(myoptarg); break;
+
 			case 'T': o.turn_time = atof(myoptarg); break;
+
 			case 'R': o.pursuit_ramp = atof(myoptarg); break;
+
 			case 'A': sysid_scale = atof(myoptarg); break;
+
 			case 'g': o.g_level = atof(myoptarg); break;
+
 			case 'v': o.speed = atof(myoptarg); break;
+
 			case 'r': o.revs = atof(myoptarg); break;
+
 			case 'a': o.altitude = atof(myoptarg); break;
+
 			case 'y': o.velocity_yaw = strcmp(myoptarg, "fixed") != 0; break;
+
 			case 'n': rate_ff = false; break;
+
 			case 't': ground_truth = true; break;
+
 			case 'L': o.land = true; break;
+
 			case 'F': o.ref_only = true; break;
+
 			case 'V': o.virt = true; break;
+
 			default: return print_usage("bad option");
 			}
 		}
@@ -1178,6 +1348,36 @@ int CapableControl::custom_command(int argc, char *argv[])
 
 		int32_t rig = 0;
 		param_get(param_find("CC_RIG_EN"), &rig);
+
+		if (o.type == capable::Scenario::ACCEL) {
+			if (o.ref_only || o.virt) {
+				PX4_ERR("fly accel is a free-flight test: -F and -V fly a reference or a virtual vehicle, not this command");
+				return 1;
+			}
+
+			if (o.turn_time <= 0.0) {
+				PX4_ERR("fly accel: -T must be greater than 0 (the time the command is held)");
+				return 1;
+			}
+
+			float acc_max_g = 4.f;
+			param_get(param_find("CC_ACC_MAX_G"), &acc_max_g);
+			const double mag = o.accel_cmd.norm(), T = o.turn_time;
+
+			if (mag > (double)acc_max_g * GRAVITY) {
+				PX4_ERR("|a| %.2f m/s^2 is above the CC_ACC_MAX_G envelope (%.2f m/s^2): (5.1) would clip it",
+					mag, (double)acc_max_g * GRAVITY);
+				return 1;
+			}
+
+			// What the vehicle will actually do, so the box can be checked before it is flown: the command
+			// phase, then append_brake_and_land()'s quintic at 0.5 g.
+			const double v_end = mag * T, d_cmd = 0.5 * mag * T * T;
+			const double t_brake = fmax(3.0, 1.5 * v_end / (0.5 * GRAVITY));
+			PX4_INFO("CAPABLE_ACCEL: (%.2f %.2f %.2f) m/s^2 = %.2f g for %.1f s -> %.1f m/s, %.0f m; then a %.1f s brake, about %.0f m more",
+				 o.accel_cmd(0), o.accel_cmd(1), o.accel_cmd(2), mag / GRAVITY, T, v_end, d_cmd, t_brake,
+				 v_end * t_brake * 0.5);
+		}
 
 		if (o.type == capable::Scenario::TILT && !o.ref_only && !o.virt) {
 			PX4_ERR("tilt is a rig test: fly tilt -F (attitude only) or -V; in free flight it would reach about 50 m/s");
@@ -1190,6 +1390,7 @@ int CapableControl::custom_command(int argc, char *argv[])
 		}
 
 #ifdef __PX4_NUTTX
+
 		// Hardware: the pilot engages the mode (RC switch, armed); fly never arms or switches mode by itself.
 		// (SITL keeps the automatic engage and arm of the test runners.)
 		if (self->_state != capable_control_status_s::STATE_HOLD) {
@@ -1209,6 +1410,7 @@ int CapableControl::custom_command(int argc, char *argv[])
 			PX4_ERR("handing back to PX4 after an abort: switch out of and back into Capable Control on the RC first");
 			return 1;
 		}
+
 		self->_requested = o;
 		self->_rate_ff = rate_ff;
 		self->_requested_ground_truth = ground_truth;
@@ -1280,6 +1482,7 @@ int CapableControl::print_status()
 	for (int i = 0; i < 4; i++) {
 		PX4_INFO("  rotor %d: px %.4f py %.4f km %.4f", i, (double)_rotor_px[i], (double)_rotor_py[i], (double)_rotor_km[i]);
 	}
+
 	perf_print_counter(_loop_perf);
 	perf_print_counter(_interval_perf);
 	return 0;
@@ -1299,16 +1502,23 @@ from state estimate to motor commands. No PX4 control loop or control allocator 
 $ capable_control start
 $ capable_control fly hover
 $ capable_control fly circle -g 4 -v 20 -r 3 -y velocity
+$ capable_control fly accel 5,0,0 -T 3 -a 30
+
+### Acceleration test
+`fly accel ax,ay,az` holds a fixed acceleration command for -T seconds with NO position loop, then
+brakes and hovers. The vector is in m/s^2 (not g) in the controller's NWU frame, gravity excluded, so
+0,0,0 commands "keep the current velocity" -- which with CC_DOB_EN 0 drifts at g (m_model/m_true - 1).
+Set CC_DOB_EN 1 for the closed-loop version.
 )DESCR_STR");
 
 	PRINT_MODULE_USAGE_NAME("capable_control", "controller");
 	PRINT_MODULE_USAGE_COMMAND("start");
-	PRINT_MODULE_USAGE_COMMAND_DESCR("fly", "engage the mode, arm and fly a scenario: hover|translate|circle|pursuit|dive|sysid|tilt (tilt: rig only, with -F or -V)");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("fly", "engage the mode, arm and fly a scenario: hover|translate|circle|pursuit|dive|sysid|tilt|accel (tilt: rig only, with -F or -V; accel: takes ax,ay,az [m/s^2] before the options)");
 	PRINT_MODULE_USAGE_PARAM_FLOAT('g', 1.f, 0.1f, 10.f, "circle: lateral acceleration [g]", true);
 	PRINT_MODULE_USAGE_PARAM_FLOAT('v', 20.f, 1.f, 60.f, "circle: speed [m/s]", true);
 	PRINT_MODULE_USAGE_PARAM_FLOAT('r', 3.f, 0.5f, 20.f, "circle: steady revolutions", true);
-	PRINT_MODULE_USAGE_PARAM_FLOAT('a', 20.f, 2.f, 200.f, "circle/pursuit: altitude [m]", true);
-	PRINT_MODULE_USAGE_PARAM_FLOAT('T', 10.f, 1.f, 120.f, "pursuit: duration of the pursuit turn [s]; tilt: ramp time [s] (default 2)", true);
+	PRINT_MODULE_USAGE_PARAM_FLOAT('a', 20.f, 2.f, 200.f, "circle/pursuit/accel: altitude [m] (accel: default 30, measured from the take-off point)", true);
+	PRINT_MODULE_USAGE_PARAM_FLOAT('T', 10.f, 1.f, 120.f, "pursuit: duration of the pursuit turn [s]; tilt: ramp time [s] (default 2); accel: hold time of the command [s] (default 3)", true);
 	PRINT_MODULE_USAGE_PARAM_FLOAT('A', 1.f, 0.1f, 4.f, "sysid: excitation amplitude scale (1 = 0.5 N m roll/pitch, 0.15 N m yaw)", true);
 	PRINT_MODULE_USAGE_PARAM_FLOAT('R', 0.f, 0.f, 5.f, "pursuit: entry ramp of the 4 g command [s] (0 = step, paper)", true);
 	PRINT_MODULE_USAGE_PARAM_STRING('y', "velocity", "velocity|fixed", "circle: yaw policy", true);

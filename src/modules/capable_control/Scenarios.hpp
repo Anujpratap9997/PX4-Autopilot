@@ -196,6 +196,7 @@ struct Segment {
 			r.v = av0 + aa0 * t + d * (duration * ui);
 			r.a = aa0 + d * b;
 			r.yaw = yaw0;
+
 		} else if (kind == QUINTIC) {
 			const double s = fmin(fmax(tau, 0.0), duration);
 			r.p = qc[0] + qc[1] * s + qc[2] * (s * s) + qc[3] * pow(s, 3) + qc[4] * pow(s, 4) + qc[5] * pow(s, 5);
@@ -222,7 +223,7 @@ class Scenario
 public:
 	static constexpr int MAX_SEGMENTS = 32;
 
-	enum Type { HOVER, TRANSLATE, CIRCLE, PURSUIT, DIVE, SYSID, TILT };
+	enum Type { HOVER, TRANSLATE, CIRCLE, PURSUIT, DIVE, SYSID, TILT, ACCEL };
 
 	struct Options {
 		Type type{HOVER};
@@ -235,6 +236,10 @@ public:
 		double pursuit_ramp{0.0};  // pursuit: smoothstep entry of the turn command [s]; 0 = step
 		double down_g{2.0};      // dive: commanded downward acceleration [g]
 		double lat_g{0.0};       // dive: commanded lateral (north) acceleration [g]
+		// accel: the commanded acceleration [m/s^2], NWU (x north, y west, z up), gravity EXCLUDED, so
+		// (0, 0, 0) is "keep the current velocity". Held for turn_time, then braked. The same quantity
+		// and the same units as the Python bench's --accel.
+		V3 accel_cmd{};
 		bool land{false};        // end with return + landing; default: brake and hold in the air
 		bool ref_only{false};    // fly -F: attitude-only, (5.8) bypassed (rig Stage A)
 		bool virt{false};        // fly -V: virtual translation driven by the real attitude (rig Stage B)
@@ -286,6 +291,7 @@ public:
 
 				if (i < 3) { add(Segment::accel(p, v, z, z, y, L, level[i])); p = last().end_p; v = last().end_v; }
 			}
+
 		} else if (o.type == TRANSLATE) {
 			takeoff(p0, yaw0, 10.0, 4.0, yaw0);
 			const V3 top = last().end_p;
@@ -298,6 +304,17 @@ public:
 			add(Segment::hold(b, y, 4.0, S::PHASE_HOLD_2));
 			add(Segment::move(b, top, y, y, 4.0, S::PHASE_MOVE_DIAGONAL));
 			add(Segment::hold(top, y, 4.0, S::PHASE_HOLD_3));
+
+		} else if (o.type == ACCEL) {
+			// Closed-loop acceleration test: hold at altitude, then the module flies the acceleration
+			// phase itself (a fixed a_cmd, no position loop) and calls append_brake_and_land().
+			// Same structure as DIVE, with an arbitrary 3D command instead of down_g / lat_g.
+			takeoff(p0, yaw0, o.altitude, 8.0, yaw0);
+			add(Segment::hold(last().end_p, last().end_yaw, 3.0, S::PHASE_HOLD_PRE));
+			finalize();
+			_pursuit_start = _duration;
+			_duration += o.turn_time;
+			return;
 
 		} else if (o.type == DIVE) {
 			// Hover at altitude; the module then flies the dive phase itself (fixed a_cmd) and

@@ -45,6 +45,7 @@ uint8 PHASE_DIVE = 22          # Sec. V-J test: fixed acceleration command (acc_
 uint8 PHASE_TILT = 24          # rig test (fly tilt -F): held pure-pitch or pure-roll tilt, or the ramps to and from it
 uint8 PHASE_SYSID = 23         # motor identification: pseudo-random torque injected on one axis at a time (torque_inj)
 uint8 PHASE_HOLD_IDLE = 25     # STATE_HOLD between fly commands (after an RC switch-in, the end of a test or a hand-back)
+uint8 PHASE_ACCEL = 26         # fly accel: a fixed acceleration command (acc_ref), no position loop
 
 bool upright              # Sec. V-J regime: true = upright (5.9), false = inverting
 
@@ -92,6 +93,15 @@ bool sat_accel            # (5.1) lateral command clipped
 bool sat_thrust           # (5.3) thrust budget hit
 bool sat_mixer            # a motor command was clipped (this vehicle's mixer)
 bool sat_mixer_paper      # the controller's own prediction for the paper's plus-frame plant
+
+# (6) acceleration disturbance observer (CC_DOB_EN). acc_meas is the measurement it is fed; comparing it
+# with acc_des is the closed-loop version of the acc_cmd vs achieved check that ulog_accel_check.py does.
+bool dob                  # the observer ran this tick (a_des had dob_d removed)
+bool dob_frozen           # the estimate was held: on the ground, saturated, or no usable measurement
+float64[3] acc_meas       # [m/s^2] measured acceleration fed to the observer, NWU, gravity removed
+float64[3] dob_model      # [m/s^2] a_model: what the model says the vehicle should be doing
+float64[3] dob_d          # [m/s^2] d_hat, subtracted from acc_des
+float64 dob_d_thrust      # [m/s^2] along-thrust part of d_hat (scalar on b_z)
 
 uint32 compute_us         # [us] time spent in the controller + mixer this tick
 

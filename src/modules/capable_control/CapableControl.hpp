@@ -35,6 +35,7 @@
 #include <uORB/topics/register_ext_component_request.h>
 #include <uORB/topics/setpoint_config.h>
 #include <uORB/topics/unregister_ext_component.h>
+#include <uORB/topics/vehicle_acceleration.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_attitude_setpoint.h>
@@ -80,7 +81,7 @@ private:
 			    const capable::Quat &q, const capable::V3 &w, const capable::Ref &ref, const capable::V3 &a_raw,
 			    const capable::ControlOutput &out, const capable::V3 &tau_cmd, const capable::V3 &tau_inj,
 			    const float u[4], const float u_raw[4], bool sat_mixer, float out_scale, bool thr_capped,
-			    uint32_t compute_us);
+			    const capable::V3 &a_meas, bool dob_held, uint32_t compute_us);
 
 	// Vehicle model (CC_* params) and mixer from CA_ROTOR* geometry (physical units),
 	// per-rotor max thrust CC_ROT_FMAX and thrust curve CC_THR_MODEL.
@@ -90,6 +91,7 @@ private:
 
 	// uORB
 	uORB::SubscriptionCallbackWorkItem _angular_velocity_sub{this, ORB_ID(vehicle_angular_velocity)};
+	uORB::Subscription _acceleration_sub{ORB_ID(vehicle_acceleration)};   // (6) observer measurement
 	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
@@ -114,6 +116,7 @@ private:
 	uORB::Publication<arming_check_reply_s> _arming_check_reply_pub{ORB_ID(arming_check_reply)};
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 
+	vehicle_acceleration_s _acceleration{};
 	vehicle_attitude_s _attitude{};
 	vehicle_local_position_s _local_position{};
 	vehicle_attitude_s _gt_attitude{};
@@ -127,6 +130,16 @@ private:
 	/** State fed to the controller this tick, in the controller's z-up frames. */
 	void read_state(const vehicle_angular_velocity_s &rates, capable::V3 &p, capable::V3 &v,
 			capable::Quat &q, capable::V3 &w) const;
+
+	// (6) acceleration disturbance observer (CC_DOB_*), config latched at each fly request
+	bool _dob_en{false};
+	/** Measured acceleration for the observer, world NWU with gravity removed. False when there is no
+	 *  fresh sample, which freezes the estimate. */
+	bool read_accel(hrt_abstime now, const capable::Quat &q, capable::V3 &a) const;
+	/** The estimate must not move where the measurement is not free-flight model error: on the ground,
+	 *  on the rig, with no position estimate, or with the translation faked (-F / -V). */
+	bool dob_frozen(uint8_t phase) const;
+	bool _from_ground{true};   // this flight started on the ground: PHASE_TAKEOFF is a real lift-off
 	bool _requested_ground_truth{false};
 
 	// state the controller sees this tick (EKF or ground truth), PX4 frames

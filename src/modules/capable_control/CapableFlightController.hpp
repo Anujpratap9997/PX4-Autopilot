@@ -41,10 +41,10 @@ inline Quat conjugate(const Quat &q) { return Quat{q.w, -q.x, -q.y, -q.z}; }
 inline Quat multiply(const Quat &p, const Quat &q)
 {
 	return Quat{
-		p.w * q.w - p.x * q.x - p.y * q.y - p.z * q.z,
-		p.w * q.x + p.x * q.w + p.y * q.z - p.z * q.y,
-		p.w * q.y - p.x * q.z + p.y * q.w + p.z * q.x,
-		p.w * q.z + p.x * q.y - p.y * q.x + p.z * q.w};
+		p.w *q.w - p.x *q.x - p.y *q.y - p.z * q.z,
+		p.w *q.x + p.x *q.w + p.y *q.z - p.z * q.y,
+		p.w *q.y - p.x *q.z + p.y *q.w + p.z * q.x,
+		p.w *q.z + p.x *q.y - p.y *q.x + p.z * q.w};
 }
 
 inline M3 to_rotation_matrix(const Quat &q_in)
@@ -153,6 +153,11 @@ struct ControlOutput {
 	// exposed for logging (locals in the Python original)
 	V3 e_r{};
 	V3 omega_desired{};
+	// (6) acceleration disturbance observer
+	bool dob_active{false};             // the observer ran this tick (a_des had d_hat removed)
+	V3 accel_disturbance{};             // d_hat, subtracted from a_des
+	V3 accel_model{};                   // a_model, what the model says the vehicle should be doing
+	double accel_disturbance_thrust{0.0};   // along-thrust part of d_hat (scalar on b_z)
 };
 
 class CapableFlightController
@@ -163,10 +168,134 @@ public:
 		_max_thrust = cap.max_thrust_to_weight * cap.mass * GRAVITY;
 	}
 
+	/** Does NOT forget the disturbance estimate: a test started from a hover inherits what the hover
+	 *  already learnt, instead of spending its first half-second re-learning the same mass error. Call
+	 *  reset_dob() explicitly for a genuinely fresh start (mode entry, a flight from the ground). */
 	void reset() { _have_prev_q_des = false; _omega_des_filtered.zero(); }
 
 	const V3 &omega_des_filtered() const { return _omega_des_filtered; }
 	double max_thrust() const { return _max_thrust; }
+
+	// ------------------------------------------------------------ (6) acceleration disturbance observer
+	//
+	// Port of capable_udan_controller.py::_update_dob (Capable_python_testing). Everything above is
+	// feed-forward: the commanded acceleration is delivered only if mass, thrust coefficient and drag are
+	// exactly what the controller assumes. The observer compares the measured acceleration with the model
+	// evaluated at the vehicle's ACTUAL attitude and lagged thrust, so the normal tilting transient appears
+	// in both terms and cancels; only model error (thrust, mass, drag, wind) is left to remove. Feeding back
+	// the command error (a_cmd - a_meas) instead would ask for ~2x at a step, because a_meas is still ~0
+	// while the vehicle tilts.
+	//
+	//     a_model = R(q) e3 T_hat/m - g e3 - k_D v
+	//     e       = LPF(a_meas) - LPF(a_model)        the same filter on both, so they stay in phase
+	//     d_hat   = LPF(e . b_z) b_z + LPF(e_perp)    split along / across the thrust axis
+	//     a_des   = a_cmd + g e3 + k_D v - d_hat
+	//
+	// Thrust and mass errors act ALONG the thrust axis, so that part is kept as a scalar on b_z and turns
+	// with the vehicle instead of lagging behind a world-frame filter. Each channel has its own clip.
+
+	void configure_dob(bool enable, double tau, double meas_tau, double max_g, double thrust_frac,
+			   double motor_tau)
+	{
+		_dob_en = enable;
+		_dob_tau = fmax(tau, 1e-3);
+		_dob_meas_tau = fmax(meas_tau, 1e-4);
+		_dob_max = fmax(max_g, 0.0) * GRAVITY;
+		_dob_thrust_frac = fmax(thrust_frac, 0.0);
+		_dob_mot_tau = fmax(motor_tau, 1e-3);
+		reset_dob();
+	}
+
+	bool dob_enabled() const { return _dob_en; }
+
+	/** The learnt estimate, so it can survive the controller being rebuilt when a fly reloads the
+	 *  parameters. Only the two filtered states are carried: T_hat and the measurement filters re-seed
+	 *  themselves on the next tick. */
+	void get_dob_estimate(V3 &d_perp, double &d_thrust) const { d_perp = _dob_d_perp; d_thrust = _dob_d_thrust; }
+	void set_dob_estimate(const V3 &d_perp, double d_thrust)
+	{
+		_dob_d_perp = d_perp;
+		_dob_d_thrust = d_thrust;
+		_dob_d = d_perp;   // the b_z part is added back by the next update, on the current b_z
+	}
+
+	/** Forget the disturbance estimate (call when (re)starting a flight). */
+	void reset_dob()
+	{
+		_dob_d.zero(); _dob_d_perp.zero(); _dob_meas_f.zero(); _dob_model_f.zero(); _dob_model.zero();
+		_dob_d_thrust = 0.0;
+		_dob_thrust = -1.0;
+		_dob_prev_thrust_cmd = -1.0;
+		_dob_filt_init = false;
+		_dob_hold = false;
+	}
+
+	/** Stop the estimate moving without forgetting it: on the ground, on the rig, or with no usable
+	 *  measurement. The ground reaction force and a pivot are not model error. */
+	void dob_freeze(bool freeze) { _dob_freeze = freeze; }
+
+	/** Close the tick: the thrust actually sent to the mixer (which the module may have ramped or capped
+	 *  after the controller returned) is what the next a_model must be built from, and a saturated tick is
+	 *  a saturation, not a model error, so the estimate is held. */
+	void dob_post(double applied_thrust, bool saturated)
+	{
+		if (!_dob_en) { return; }
+
+		_dob_prev_thrust_cmd = applied_thrust;
+		_dob_hold = _dob_hold || saturated;
+	}
+
+	/** One observer step; returns d_hat, the acceleration the model fails to predict.
+	 *
+	 *  TIMING. accel_measured is what the vehicle did over the previous step, under the thrust commanded on
+	 *  the previous tick and ending at the attitude it has now, so the model is built from exactly those.
+	 *
+	 *  MOTOR LAG. The plant lags rotor speed with time constant tau and T = b omega^2; linearized,
+	 *  dT/dt = (T_d - T)/tau, so the thrust lags with the same tau. */
+	V3 update_dob(const V3 &accel_measured, const Quat &quaternion, const V3 *velocity, double dt)
+	{
+		if (_dob_prev_thrust_cmd < 0.0) { return _dob_d; }   // first tick: nothing commanded yet
+
+		if (_dob_thrust < 0.0) { _dob_thrust = _dob_prev_thrust_cmd; }
+
+		const double alpha_motor = 1.0 - std::exp(-dt / _dob_mot_tau);
+		_dob_thrust += alpha_motor * (_dob_prev_thrust_cmd - _dob_thrust);
+
+		const M3 R = to_rotation_matrix(quaternion);
+		const V3 body_z(R(0, 2), R(1, 2), R(2, 2));
+		const double thrust_accel = _dob_thrust / _cap.mass;
+		V3 a_model = body_z * thrust_accel - V3(0.0, 0.0, GRAVITY);
+
+		// Drag only if the controller is told the velocity: then it is part of the model (and of the
+		// (5.2) feed-forward). Without it, drag is simply one more thing the observer absorbs.
+		if (velocity) { a_model = a_model - (*velocity) * _cap.linear_drag; }
+
+		_dob_model = a_model;
+
+		if (!_dob_filt_init) { _dob_meas_f = accel_measured; _dob_model_f = a_model; _dob_filt_init = true; }
+
+		const double alpha_meas = dt / (_dob_meas_tau + dt);
+		_dob_meas_f = _dob_meas_f + (accel_measured - _dob_meas_f) * alpha_meas;
+		_dob_model_f = _dob_model_f + (a_model - _dob_model_f) * alpha_meas;
+
+		if (!_dob_hold && !_dob_freeze) {
+			const double alpha_d = dt / (_dob_tau + dt);
+			const V3 error = _dob_meas_f - _dob_model_f;
+			const double error_thrust = error.dot(body_z);
+			_dob_d_thrust += alpha_d * (error_thrust - _dob_d_thrust);
+			_dob_d_perp = _dob_d_perp + ((error - body_z * error_thrust) - _dob_d_perp) * alpha_d;
+			_dob_d_perp = _dob_d_perp - body_z * _dob_d_perp.dot(body_z);   // b_z has moved
+
+			const double limit = _dob_thrust_frac * thrust_accel;
+			_dob_d_thrust = fmin(fmax(_dob_d_thrust, -limit), limit);
+			const double n = _dob_d_perp.norm();
+
+			if (n > _dob_max && n > 1e-12) { _dob_d_perp = _dob_d_perp * (_dob_max / n); }
+		}
+
+		_dob_d = body_z * _dob_d_thrust + _dob_d_perp;
+		return _dob_d;
+	}
 
 	bool saturate_command(V3 &a_cmd) const
 	{
@@ -272,9 +401,13 @@ public:
 		return false;
 	}
 
-	/** dt <= 0 disables the attitude-rate feed-forward, like dt=None in Python. */
+	/** dt <= 0 disables the attitude-rate feed-forward, like dt=None in Python.
+	 *  accel_measured (world frame, gravity removed) and dob_dt drive the (6) observer; dob_dt is the real
+	 *  sample interval, kept separate from dt so that running without the rate feed-forward (fly -n) does
+	 *  not also switch the observer off. */
 	ControlOutput attitude_and_thrust(V3 commanded_acceleration, const Quat &quaternion, const V3 &body_rates,
-					  double yaw_ref, const V3 *velocity, double dt)
+					  double yaw_ref, const V3 *velocity, double dt,
+					  const V3 *accel_measured = nullptr, double dob_dt = 0.0)
 	{
 		ControlOutput out;
 		// 1. (5.1)
@@ -285,6 +418,13 @@ public:
 		V3 a_des = a_cmd + V3(0.0, 0.0, GRAVITY);
 
 		if (velocity) { a_des = a_des + (*velocity) * _cap.linear_drag; }
+
+		// 2b. (6) disturbance observer: remove what the model fails to predict. After the (5.1) envelope
+		//     clip, like the drag feed-forward, because it corrects the MODEL and not the request; before
+		//     (5.3), which stays the hard physical limit.
+		const bool dob_active = _dob_en && accel_measured != nullptr && dob_dt > 0.0;
+
+		if (dob_active) { a_des = a_des - update_dob(*accel_measured, quaternion, velocity, dob_dt); }
 
 		// 3. (5.3)
 		out.saturated_thrust = prioritize_vertical(a_des);
@@ -337,13 +477,34 @@ public:
 		out.saturated_mixer = mixer_saturates(out.collective_thrust, out.body_torque);
 		out.e_r = e_R;
 		out.omega_desired = omega_desired;
+
+		if (dob_active) {
+			// Inputs to the NEXT tick's observer update (see update_dob, TIMING). The module overrides the
+			// thrust through dob_post() with what it actually sent, and adds its own mixer saturation.
+			_dob_prev_thrust_cmd = out.collective_thrust;
+			_dob_hold = out.saturated_thrust || out.saturated_mixer;
+
+		} else {
+			// The observer did not run (no measurement, or disabled): T_hat and the measurement filters
+			// would carry an arbitrarily old state into the tick it resumes on, and the difference against
+			// a fresh a_meas would be read as a disturbance. Re-seed them instead. The learnt d_hat is
+			// kept -- it is still the best estimate of the vehicle's model error.
+			_dob_thrust = -1.0;
+			_dob_filt_init = false;
+		}
+
+		out.dob_active = dob_active;
+		out.accel_disturbance = _dob_d;
+		out.accel_model = _dob_model;
+		out.accel_disturbance_thrust = _dob_d_thrust;
 		return out;
 	}
 
 	/** Reference-tracking mode (5.8). */
 	ControlOutput compute(const V3 &position, const V3 &velocity, const Quat &quaternion, const V3 &body_rates,
 			      const V3 &position_ref, const V3 &velocity_ref, const V3 &acceleration_ref,
-			      double yaw_ref, double dt, V3 *a_cmd_raw = nullptr)
+			      double yaw_ref, double dt, V3 *a_cmd_raw = nullptr,
+			      const V3 *accel_measured = nullptr, double dob_dt = 0.0)
 	{
 		const V3 pe = position_ref - position;
 		const V3 ve = velocity_ref - velocity;
@@ -353,7 +514,7 @@ public:
 
 		if (a_cmd_raw) { *a_cmd_raw = a_cmd; }
 
-		return attitude_and_thrust(a_cmd, quaternion, body_rates, yaw_ref, &velocity, dt);
+		return attitude_and_thrust(a_cmd, quaternion, body_rates, yaw_ref, &velocity, dt, accel_measured, dob_dt);
 	}
 
 private:
@@ -362,6 +523,22 @@ private:
 	Quat _prev_q_des{};
 	bool _have_prev_q_des{false};
 	V3 _omega_des_filtered{};
+
+	// (6) disturbance observer; disabled until configure_dob() turns it on, so the controller is then
+	// bit-identical to the paper's.
+	bool _dob_en{false};
+	double _dob_tau{0.2};           // [s] disturbance filter: larger = less noise, slower to learn
+	double _dob_meas_tau{0.02};     // [s] applied identically to a_meas and a_model, so they stay in phase
+	double _dob_max{0.3 * GRAVITY}; // [m/s^2] clip on the across-thrust part
+	double _dob_thrust_frac{0.5};   // clip on the along-thrust part, fraction of T_hat/m
+	double _dob_mot_tau{0.055};     // [s] motor time constant used for T_hat
+	V3 _dob_d{}, _dob_d_perp{}, _dob_meas_f{}, _dob_model_f{}, _dob_model{};
+	double _dob_d_thrust{0.0};
+	double _dob_thrust{-1.0};           // T_hat, thrust after the motor lag; < 0: not initialised
+	double _dob_prev_thrust_cmd{-1.0};  // thrust applied on the previous tick; < 0: nothing commanded yet
+	bool _dob_filt_init{false};
+	bool _dob_hold{false};              // previous tick saturated: the difference is not model error
+	bool _dob_freeze{false};            // external gate (ground, rig, no measurement)
 };
 
 } // namespace capable

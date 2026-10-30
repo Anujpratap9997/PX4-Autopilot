@@ -238,3 +238,63 @@ parameters:
       type: boolean
       default: 0
       reboot_required: true
+    CC_DOB_EN:
+      description:
+        short: Acceleration disturbance observer (closed-loop acceleration)
+        long: |-
+          0: the controller is the paper's, feed-forward only. The commanded acceleration is delivered only if
+          CC_MASS, CC_ROT_FMAX and CC_DRAG are exactly right; a 10 % mass error is about 1 m/s^2 of error that
+          nothing removes, and in `fly accel` / `fly dive` / `fly pursuit` there is no position loop to hide it.
+          1: the observer compares the measured acceleration (vehicle_acceleration, rotated to NWU with gravity
+          removed) with the model at the vehicle's actual attitude and lagged thrust, and subtracts the
+          difference from a_des. It is held on the ground, while saturated, and whenever the measurement is
+          missing; it never runs with CC_RIG_EN 1 or with fly -F / -V, where translation is not physical.
+      type: boolean
+      default: 0
+    CC_DOB_TAU:
+      description:
+        short: 'Observer: disturbance filter time constant'
+        long: |-
+          Larger = less noise fed back, slower to learn. 0.2 s (about 0.8 Hz) is the value the Python bench
+          validated at CC_ATT_WN 14. The attitude loop is the observer's inner loop for the across-thrust
+          channel, so keep CC_ATT_WN at least 2-3x 1/CC_DOB_TAU: at CC_ATT_WN 6 use 0.4 s or more.
+      type: float
+      default: 0.2
+      unit: s
+      min: 0.05
+      max: 2.0
+      decimal: 2
+    CC_DOB_MTAU:
+      description:
+        short: 'Observer: measurement filter time constant'
+        long: |-
+          Applied identically to the measured and the modelled acceleration, so the two stay in phase and the
+          normal tilting lag cancels instead of being learnt as a disturbance.
+      type: float
+      default: 0.02
+      unit: s
+      min: 0.002
+      max: 0.5
+      decimal: 3
+    CC_DOB_MAXG:
+      description:
+        short: 'Observer: clip on the across-thrust part of d_hat'
+        long: |-
+          Fraction of g. This channel holds drag error, wind and the estimator's tilt/bias ambiguity.
+      type: float
+      default: 0.3
+      min: 0.0
+      max: 2.0
+      decimal: 2
+    CC_DOB_TFRAC:
+      description:
+        short: 'Observer: clip on the along-thrust part of d_hat'
+        long: |-
+          Fraction of the current thrust acceleration. Mass and thrust-coefficient errors act along the thrust
+          axis, and they are large: a vehicle configured for 3.5 kg that weighs 2.5 kg needs 40 %, so a 30 %
+          clip would silently cap it.
+      type: float
+      default: 0.5
+      min: 0.05
+      max: 1.0
+      decimal: 2
