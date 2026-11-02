@@ -88,6 +88,9 @@ float32 output_scale      # rig soft start: wrench scale 0..1 (1 outside rig mod
 bool thrust_capped        # rig mode: collective limited to CC_RIG_THR x max thrust
 float32[4] u              # motor commands sent (actuator_motors), 0..1
 float32[4] u_raw          # unclipped mixer solution
+bool att_branch_a         # (5.4) construction in use: true = A (y_b ⊥ x_c), false = B
+bool omega_ff_clamped     # (5.6) omega_raw hit the rate limit this tick
+
 
 bool sat_accel            # (5.1) lateral command clipped
 bool sat_thrust           # (5.3) thrust budget hit
