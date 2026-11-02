@@ -19,6 +19,7 @@ using V3 = matrix::Vector3d;
 using M3 = matrix::SquareMatrix<double, 3>;
 
 static constexpr double GRAVITY = 9.80665;
+static constexpr double kOmegaFfScale = 1.0;
 
 // ---------------------------------------------------------------- quaternion helpers (quaternion_utils.py)
 
@@ -171,7 +172,7 @@ public:
 	/** Does NOT forget the disturbance estimate: a test started from a hover inherits what the hover
 	 *  already learnt, instead of spending its first half-second re-learning the same mass error. Call
 	 *  reset_dob() explicitly for a genuinely fresh start (mode entry, a flight from the ground). */
-	void reset() { _have_prev_q_des = false; _omega_des_filtered.zero(); }
+	void reset() { _have_prev_q_des = false; _omega_des_filtered.zero(); _att_branch_init = false; }
 
 	const V3 &omega_des_filtered() const { return _omega_des_filtered; }
 	double max_thrust() const { return _max_thrust; }
@@ -335,7 +336,7 @@ public:
 		return true;
 	}
 
-	Quat desired_attitude(const V3 &a_des, double yaw_ref) const
+	Quat desired_attitude(const V3 &a_des, double yaw_ref)
 	{
 		const double norm = a_des.norm();
 
@@ -350,14 +351,42 @@ public:
 		const V3 cross_y = cross(y_c, z_b);
 		V3 x_b, y_b;
 
-		if (cross_x.norm() >= cross_y.norm()) {
-			y_b = cross_x / cross_x.norm();
+
+		const double nx = cross_x.norm(), ny = cross_y.norm();
+		constexpr double kBranchFloor  = 0.30;   // switch only when the current branch is ill-conditioned
+		constexpr double kBranchMargin = 0.05;   // and only if the alternative is clearly better
+
+		if (!_att_branch_init) {
+			_att_branch_a = false;               // start on branch B
+			_att_branch_init = true;
+		}
+
+		const double n_cur = _att_branch_a ? nx : ny;
+		const double n_alt = _att_branch_a ? ny : nx;
+
+		if (n_cur < kBranchFloor && n_alt > n_cur + kBranchMargin) {
+			_att_branch_a = !_att_branch_a;
+		}
+
+		if (_att_branch_a) {
+			y_b = cross_x / fmax(nx, 1e-9);
 			x_b = cross(y_b, z_b);
 
 		} else {
-			x_b = cross_y / cross_y.norm();
+			x_b = cross_y / fmax(ny, 1e-9);
 			y_b = cross(z_b, x_b);
 		}
+
+
+
+		// if (cross_x.norm() >= cross_y.norm()) {
+		// 	y_b = cross_x / cross_x.norm();
+		// 	x_b = cross(y_b, z_b);
+
+		// } else {
+		// 	x_b = cross_y / cross_y.norm();
+		// 	y_b = cross(z_b, x_b);
+		// }
 
 		M3 R;
 
@@ -450,7 +479,16 @@ public:
 
 			if (dq.w < 0.0) { dq = Quat{-dq.w, -dq.x, -dq.y, -dq.z}; }
 
-			const V3 omega_raw = dq.vec() * (2.0 / dt);
+			V3 omega_raw = dq.vec() * (2.0 / dt);
+
+			// Don't differentiate a discontinuity: (5.4) steps q_des when the construction
+			// switches, and one tick of that step would reach the filter as ~29 rad/s.
+			const double cap_xy = kOmegaFfScale * _cap.omega_n_att;
+			const double cap_z  = kOmegaFfScale * _cap.omega_n_yaw;
+			omega_raw(0) = fmin(fmax(omega_raw(0), -cap_xy), cap_xy);
+			omega_raw(1) = fmin(fmax(omega_raw(1), -cap_xy), cap_xy);
+			omega_raw(2) = fmin(fmax(omega_raw(2), -cap_z),  cap_z);
+
 			const double tau_filter = 0.02;
 			const double alpha = dt / (tau_filter + dt);
 			_omega_des_filtered = _omega_des_filtered * (1.0 - alpha) + omega_raw * alpha;
@@ -522,6 +560,9 @@ private:
 	double _max_thrust;
 	Quat _prev_q_des{};
 	bool _have_prev_q_des{false};
+	bool _att_branch_a{false};      // false = branch B (x_b ⊥ y_c); heading == yaw_ref
+	bool _att_branch_init{false};
+
 	V3 _omega_des_filtered{};
 
 	// (6) disturbance observer; disabled until configure_dob() turns it on, so the controller is then
