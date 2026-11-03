@@ -19,7 +19,7 @@ using V3 = matrix::Vector3d;
 using M3 = matrix::SquareMatrix<double, 3>;
 
 static constexpr double GRAVITY = 9.80665;
-static constexpr double kOmegaFfScale = 1.0;
+static constexpr double kOmegaFfScale = 5.0;
 
 // ---------------------------------------------------------------- quaternion helpers (quaternion_utils.py)
 
@@ -154,6 +154,8 @@ struct ControlOutput {
 	// exposed for logging (locals in the Python original)
 	V3 e_r{};
 	V3 omega_desired{};
+	bool att_branch_a{false};       // (5.4) construction in use: true = A, false = B
+	bool omega_ff_clamped{false};   // (5.6) omega_raw hit the rate limit this tick
 	// (6) acceleration disturbance observer
 	bool dob_active{false};             // the observer ran this tick (a_des had d_hat removed)
 	V3 accel_disturbance{};             // d_hat, subtracted from a_des
@@ -485,6 +487,7 @@ public:
 			// switches, and one tick of that step would reach the filter as ~29 rad/s.
 			const double cap_xy = kOmegaFfScale * _cap.omega_n_att;
 			const double cap_z  = kOmegaFfScale * _cap.omega_n_yaw;
+			out.omega_ff_clamped = fabs(omega_raw(0)) > cap_xy || fabs(omega_raw(1)) > cap_xy || fabs(omega_raw(2)) > cap_z;
 			omega_raw(0) = fmin(fmax(omega_raw(0), -cap_xy), cap_xy);
 			omega_raw(1) = fmin(fmax(omega_raw(1), -cap_xy), cap_xy);
 			omega_raw(2) = fmin(fmax(omega_raw(2), -cap_z),  cap_z);
@@ -510,6 +513,7 @@ public:
 		const double c = a_des(2) / fmax(a_des.norm(), 1e-12);
 		out.tilt_rad = std::acos(fmin(fmax(c, -1.0), 1.0));
 		out.desired_quaternion = q_des;
+		out.att_branch_a = _att_branch_a;
 		out.desired_acceleration = a_des;
 		out.commanded_acceleration = a_des - V3(0.0, 0.0, GRAVITY);
 		out.saturated_mixer = mixer_saturates(out.collective_thrust, out.body_torque);

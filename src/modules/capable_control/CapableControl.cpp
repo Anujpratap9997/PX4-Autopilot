@@ -644,6 +644,8 @@ void CapableControl::publish_status(hrt_abstime now, double t_fly, double dt, bo
 	s.sat_thrust = out.saturated_thrust;
 	s.sat_mixer = sat_mixer;
 	s.sat_mixer_paper = out.saturated_mixer;
+	s.att_branch_a = out.att_branch_a;
+	s.omega_ff_clamped = out.omega_ff_clamped;
 	s.dob = out.dob_active;
 	s.dob_frozen = dob_held;
 	s.dob_d_thrust = out.accel_disturbance_thrust;
