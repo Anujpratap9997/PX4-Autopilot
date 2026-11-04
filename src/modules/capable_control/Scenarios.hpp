@@ -346,11 +346,18 @@ public:
 			const double spin = fmax(8.0, 1.875 * o.speed / (0.6 * GRAVITY));
 			const double circle_yaw = o.velocity_yaw ? M_PI / 2 : yaw0;
 			takeoff(p0, yaw0, o.altitude, 6.0, circle_yaw);
-			const V3 top = last().end_p;
-			_center = top - V3(_radius, 0.0, 0.0);
-			add(Segment::hold(top, last().end_yaw, 3.0, S::PHASE_HOLD_PRE));
+			// The circle is centred on the take-off point: climb above it, fly the radius out to the rim
+			// at theta = 0, orbit, then fly the radius back to the centre and hold there. Both radial legs
+			// are minimum-jerk moves, so they meet the orbit at rest (the spin-up starts from zero rate).
+			_center = last().end_p;
+			const double y_top = last().end_yaw;   // == circle_yaw, the orbit's yaw at theta = 0
+			const V3 entry = _center + V3(_radius, 0.0, 0.0);
+			const double radial = move_time(_radius, 10.0);
+			add(Segment::hold(_center, y_top, 3.0, S::PHASE_HOLD_PRE));
+			add(Segment::move(_center, entry, y_top, y_top, radial, S::PHASE_MOVE_NORTH));
 			add(Segment::circle(_center, _radius, 0.0, _rate, spin, o.revs, o.velocity_yaw, yaw0));
-			add(Segment::hold(last().end_p, last().end_yaw, 3.0, S::PHASE_HOLD_POST));
+			add(Segment::move(last().end_p, _center, last().end_yaw, yaw0, radial, S::PHASE_RETURN));
+			add(Segment::hold(_center, yaw0, 3.0, S::PHASE_HOLD_POST));
 		}
 
 		land(p0);
