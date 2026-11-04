@@ -415,7 +415,7 @@ private:
 
 	/** Fly back over the take-off point (same altitude) before descending (scenarios.py: "return"). */
 	void return_home(const V3 &p0)
-	{4	3.5	26
+	{
 		const V3 last_p = last().end_p;
 		const V3 home(p0(0), p0(1), last_p(2));
 		const double dist = (home - last_p).norm();
